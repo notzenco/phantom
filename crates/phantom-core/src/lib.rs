@@ -6,6 +6,15 @@ pub mod pass;
 pub mod pipeline;
 
 pub use error::PhantomError;
+pub use ir::{
+    block::{BasicBlock, BlockId, CallTarget, Terminator},
+    function::Function,
+    instruction::{Instruction, InstructionMeta, Opcode},
+    module::{BinaryMetadata, DataSection, Module, ProgramHeader, Relocation, SectionHeader, SectionPermissions},
+    types::{DataRef, ImmValue, MemOperand, Operand, OperandSize, PhysReg, VReg},
+};
+pub use pass::{Pass, PassInfo};
+pub use pipeline::Pipeline;
 
 /// Target architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
