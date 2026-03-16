@@ -19,8 +19,11 @@ Encrypts all detected string literals in data sections using XOR with random key
 1. Scan instructions for DataRefs marked as strings
 2. XOR-encrypt string bytes in-place in data sections
 3. Generate per-string decryptor thunks (self-contained x86-64 machine code)
-4. Generate `__phantom_init` function that calls all thunks then jumps to original entry
-5. Backend redirects entry point to `__phantom_init`
+4. Attach backend-patchable raw fixups to injected code so final addresses can be resolved after layout
+5. Generate `__phantom_init` function that calls all thunks then jumps to original entry
+6. Backend redirects entry point to `__phantom_init`
+
+The injected code path now supports both ET_EXEC and ET_DYN/PIE outputs. PIE binaries recover runtime addresses from load bias rather than assuming fixed absolute addresses.
 
 ### Deterministic output
 

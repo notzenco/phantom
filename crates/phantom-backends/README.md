@@ -12,9 +12,12 @@ The backend uses **patch-based emission** — it starts from the original binary
 2. **Patch data sections** — Write modified data (e.g., encrypted strings) back to file offsets
 3. **Make segments writable** — Add PF_W to segments containing encrypted data (for runtime decryption)
 4. **Append new functions** — Add new code (decryptor thunks) as a new PT_LOAD segment
-5. **Redirect entry point** — If `__phantom_init` exists, set it as the ELF entry point
+5. **Apply raw fixups** — Patch backend-owned immediates in injected raw-code functions after final addresses are assigned
+6. **Redirect entry point** — If `__phantom_init` exists, set it as the ELF entry point
 
 New PT_LOAD segments are added by overwriting a PT_NOTE program header (not needed for execution), avoiding phdr table relocation.
+
+Injected code fixups allow the same pass-generated raw machine code to work for both ET_EXEC and ET_DYN/PIE binaries. ET_EXEC can use direct absolute targets where valid, while ET_DYN/PIE computes runtime addresses from load bias plus link-time virtual offsets.
 
 ## Usage
 

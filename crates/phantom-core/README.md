@@ -13,7 +13,7 @@ Module
 ├── BinaryMetadata (entry point, program/section headers, PIE flag)
 ├── DataSection[] (name, vaddr, data bytes, permissions, relocations)
 ├── Function[]
-│   ├── name, address, size, vreg_map
+│   ├── name, address, size, vreg_map, raw_bytes, raw_fixups
 │   └── BasicBlock[]
 │       ├── BlockId, start/end addr, Terminator
 │       └── Instruction[]
@@ -29,6 +29,7 @@ Module
 - **`Opcode`** — Curated x86-64 instruction set + `RawBytes` catch-all
 - **`Operand`** — Register, immediate, memory, or RIP-relative
 - **`Terminator`** — Block exit: jump, branch, call, return, etc.
+- **`RawCodeFixup`** — Backend-patchable metadata for injected raw machine code
 - **`Pass`** trait — Transform passes that mutate a `Module`
 - **`Pipeline`** — Ordered execution of passes with tracing
 
