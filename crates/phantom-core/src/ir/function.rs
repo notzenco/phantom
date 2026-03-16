@@ -6,6 +6,22 @@ use super::block::{BasicBlock, BlockId};
 use super::instruction::Instruction;
 use super::types::{PhysReg, VReg};
 
+/// A backend-applied patch for raw injected function bytes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawCodeFixup {
+    /// Byte offset within the encoded function body where an 8-byte immediate lives.
+    pub offset: u64,
+    /// The value source to write at that offset.
+    pub target: RawCodeFixupTarget,
+}
+
+/// Source for a backend-applied raw code fixup.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RawCodeFixupTarget {
+    /// The assigned link-time address of this function plus `offset`.
+    FunctionAddress { offset: u64 },
+}
+
 /// A function in the IR — contains an ordered list of basic blocks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Function {
@@ -16,6 +32,7 @@ pub struct Function {
     pub blocks: Vec<BasicBlock>,
     pub vreg_map: HashMap<VReg, PhysReg>,
     pub next_vreg: u32,
+    pub raw_fixups: Vec<RawCodeFixup>,
 }
 
 impl Function {
@@ -29,6 +46,7 @@ impl Function {
             blocks: Vec::new(),
             vreg_map: HashMap::new(),
             next_vreg: 0,
+            raw_fixups: Vec::new(),
         }
     }
 
@@ -75,6 +93,7 @@ mod tests {
         assert!(f.blocks.is_empty());
         assert!(f.vreg_map.is_empty());
         assert_eq!(f.next_vreg, 0);
+        assert!(f.raw_fixups.is_empty());
     }
 
     #[test]

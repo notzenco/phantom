@@ -1,0 +1,126 @@
+[[demo]]
+name = "banner_messages"
+source = "src/banner_messages.c"
+string_probes = ["banner:%s|%s|%s"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "banner:alpha|beta|gamma\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "string_table_lookup"
+source = "src/string_table_lookup.c"
+string_probes = ["lookup:%s", "amber", "cerulean", "vermilion"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "lookup:amber\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "command_router"
+source = "src/command_router.c"
+string_probes = ["route:%s", "north-east", "south-hold", "west-gate"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "route:north-east\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "function_pointer_menu"
+source = "src/function_pointer_menu.c"
+string_probes = ["ops:%s=%d,%s=%d,%s=%d"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "ops:add=7,mul=12,sub=2\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "state_machine_parser"
+source = "src/state_machine_parser.c"
+string_probes = ["states:%s,%s,%s"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "states:IDLE,READ,DONE\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "checksum_report"
+source = "src/checksum_report.c"
+string_probes = ["checksum:0x%04x"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "checksum:0x00ea\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "config_merge"
+source = "src/config_merge.c"
+string_probes = ["cfg:mode=%s,retries=%s,region=%s"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "cfg:mode=fast,retries=3,region=lab\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "csv_stats"
+source = "src/csv_stats.c"
+string_probes = ["csv:rows=%ld,sum=%ld,max=%ld", "3,11,5", "8,0,0", "0,0,0"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "csv:rows=4,sum=27,max=11\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "mini_vm"
+source = "src/mini_vm.c"
+string_probes = ["vm:acc=%d"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "vm:acc=19\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo]]
+name = "error_paths"
+source = "src/error_paths.c"
+string_probes = ["status:ok", "status:fail code=17", "--fail"]
+
+[[demo.case]]
+name = "ok"
+args = []
+expect_stdout = "status:ok\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo.case]]
+name = "fail"
+args = ["--fail"]
+expect_stdout = ""
+expect_stderr = "status:fail code=17\n"
+expect_exit = 17

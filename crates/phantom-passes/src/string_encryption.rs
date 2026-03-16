@@ -8,7 +8,7 @@ use rand::{Rng, SeedableRng};
 use tracing::{debug, info, warn};
 
 use phantom_core::ir::block::{BasicBlock, BlockId, Terminator};
-use phantom_core::ir::function::Function;
+use phantom_core::ir::function::{Function, RawCodeFixup, RawCodeFixupTarget};
 use phantom_core::ir::instruction::{Instruction, InstructionMeta, Opcode};
 use phantom_core::ir::module::Module;
 use phantom_core::ir::types::OperandSize;
@@ -33,6 +33,12 @@ struct EncryptedString {
     len: usize,
     /// XOR key used to encrypt.
     key: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct RawCodeBlob {
+    bytes: Vec<u8>,
+    fixups: Vec<RawCodeFixup>,
 }
 
 /// A transform pass that encrypts string literals in data sections using XOR
@@ -94,12 +100,12 @@ impl Pass for StringEncryptionPass {
         let encrypted = encrypt_strings(module, &unique_vaddrs, self.seed)?;
 
         // Step 3: Generate per-string decryptor thunk functions.
-        let mut thunk_codes: Vec<Vec<u8>> = Vec::new();
+        let mut thunk_codes = Vec::new();
         for enc in &encrypted {
-            let thunk_code = generate_thunk(enc.vaddr, enc.len, &enc.key);
+            let thunk_code = generate_thunk_with_fixups(enc.vaddr, enc.len, &enc.key);
             debug!(
                 "Generated decryptor thunk ({} bytes) for string at {:#x}",
-                thunk_code.len(),
+                thunk_code.bytes.len(),
                 enc.vaddr,
             );
             thunk_codes.push(thunk_code);
@@ -110,13 +116,13 @@ impl Pass for StringEncryptionPass {
         //   - Jumps to the original entry point
         // The backend assigns addresses and redirects the ELF entry point.
         let original_entry = module.metadata.entry_point;
-        let init_code = generate_init_function(&thunk_codes, original_entry);
+        let init_code = generate_init_function_with_fixups(&thunk_codes, original_entry);
         let init_fn = make_thunk_function("__phantom_init", &init_code);
         module.functions.push(init_fn);
 
         info!(
             "Generated __phantom_init ({} bytes) wrapping {} decryptor thunk(s), entry={:#x}",
-            init_code.len(),
+            init_code.bytes.len(),
             thunk_codes.len(),
             original_entry,
         );
@@ -247,6 +253,11 @@ use rand::RngCore;
 /// Key bytes are appended immediately after the RET instruction.
 #[allow(clippy::vec_init_then_push)]
 pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u8> {
+    generate_thunk_with_fixups(string_vaddr, string_len, key).bytes
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn generate_thunk_with_fixups(string_vaddr: u64, string_len: usize, key: &[u8]) -> RawCodeBlob {
     assert_eq!(
         key.len(),
         string_len,
@@ -254,16 +265,33 @@ pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u
     );
 
     let mut code = Vec::new();
+    let mut fixups = Vec::new();
 
     // Save registers we clobber.
+    code.push(0x53); // push rbx
     code.push(0x57); // push rdi
     code.push(0x56); // push rsi
     code.push(0x51); // push rcx
     code.push(0x52); // push rdx
 
-    // mov rsi, imm64  — absolute address of the encrypted string
+    // Compute the image load bias as runtime_ip - link_time_ip.
+    code.extend_from_slice(&[0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]); // lea rbx, [rip+0]
+    let anchor_offset = code.len() as u64;
+    code.extend_from_slice(&[0x48, 0xBA]); // mov rdx, imm64
+    let anchor_fixup_offset = code.len() as u64;
+    code.extend_from_slice(&0u64.to_le_bytes());
+    fixups.push(RawCodeFixup {
+        offset: anchor_fixup_offset,
+        target: RawCodeFixupTarget::FunctionAddress {
+            offset: anchor_offset,
+        },
+    });
+    code.extend_from_slice(&[0x48, 0x29, 0xD3]); // sub rbx, rdx
+
+    // mov rsi, imm64  — link-time address of the encrypted string
     code.extend_from_slice(&[0x48, 0xBE]);
     code.extend_from_slice(&string_vaddr.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x01, 0xDE]); // add rsi, rbx
 
     // mov ecx, imm32  — string length (loop counter)
     code.push(0xB9);
@@ -298,15 +326,17 @@ pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u
     let jnz_disp = (loop_start as isize - loop_end as isize) as i8;
     code[jnz_pos + 1] = jnz_disp as u8;
 
-    // mov rax, imm64  — return the decrypted string address in rax
+    // mov rax, imm64  — return the relocated decrypted string address in rax
     code.extend_from_slice(&[0x48, 0xB8]);
     code.extend_from_slice(&string_vaddr.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x01, 0xD8]); // add rax, rbx
 
     // Restore saved registers.
     code.push(0x5A); // pop rdx
     code.push(0x59); // pop rcx
     code.push(0x5E); // pop rsi
     code.push(0x5F); // pop rdi
+    code.push(0x5B); // pop rbx
 
     // ret
     code.push(0xC3);
@@ -321,7 +351,7 @@ pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u
     let disp = (ret_pos as i32) - (lea_next_ip as i32);
     code[lea_pos + 3..lea_pos + 7].copy_from_slice(&disp.to_le_bytes());
 
-    code
+    RawCodeBlob { bytes: code, fixups }
 }
 
 /// Generate the __phantom_init function that inlines all decryptor thunks
@@ -334,84 +364,83 @@ pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u
 /// We inline them sequentially (replacing each RET with the next thunk) and end
 /// with a jump to the original entry point.
 pub fn generate_init_function(thunk_codes: &[Vec<u8>], original_entry: u64) -> Vec<u8> {
+    let blobs = thunk_codes
+        .iter()
+        .map(|code| RawCodeBlob {
+            bytes: code.clone(),
+            fixups: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    generate_init_function_with_fixups(&blobs, original_entry).bytes
+}
+
+fn generate_init_function_with_fixups(
+    thunk_codes: &[RawCodeBlob],
+    original_entry: u64,
+) -> RawCodeBlob {
     let mut code = Vec::new();
+    let mut fixups = Vec::new();
 
-    // Inline each thunk. Each thunk ends with RET (0xC3) followed by key data.
-    // We include the full thunk (including RET and key data) and use CALL rel32
-    // to invoke each one, since the thunks are position-independent and we don't
-    // know their absolute addresses at this point.
-    //
-    // Simpler approach: just concatenate all thunk bytes as-is (each is a complete
-    // function with push/pop/ret). Then we use relative CALLs to invoke them.
-    //
-    // Even simpler: since each thunk is position-independent and self-contained,
-    // we CALL each one using relative addressing. But the addresses aren't known
-    // until the backend assigns them.
-    //
-    // Simplest working approach: inline the decryption loops directly without
-    // the register saves/restores (since we control the whole init sequence).
-    // Actually, let's keep it really simple: emit all thunks inline, then jmp.
-
-    // Save all callee-saved registers (we're the entry point, no caller to save for,
-    // but we need a clean state for the real entry).
-    // Actually, at program entry, registers are in an undefined state (except RSP
-    // and a few set by the kernel), so we just need to preserve RSP.
+    // Preserve process-entry register state expected by the original entry point.
+    code.push(0x50); // push rax
+    code.push(0x53); // push rbx
+    code.push(0x52); // push rdx
 
     for thunk in thunk_codes {
-        // Each thunk is: [push regs] [decrypt loop] [mov rax, addr] [pop regs] [ret] [key data]
-        // We want everything except the RET. Find the RET byte that precedes the key data.
-        // The key data starts after the last RET (0xC3). We need the full thunk
-        // including key data for the LEA [rip+offset] to work.
-        //
-        // Actually, each thunk's LEA uses RIP-relative addressing to find its key.
-        // If we inline it, the RIP offsets still work because we include the key data.
-        // We just need to skip the RET and continue to next thunk.
-        //
-        // Find the RET: it's the 0xC3 byte before the key data. The key starts at
-        // a known offset. Let's just include the full thunk and convert RET to a
-        // 2-byte JMP over the key data to reach the next thunk.
-        //
-        // This is getting complex. Simplest approach: CALL each thunk as a subroutine.
-        // Emit: CALL +5 (to thunk code) / JMP past thunk / thunk bytes
-        // But that requires knowing thunk size.
-        //
-        // OK, simplest of all: just include each complete thunk inline. The RET will
-        // return to... nowhere useful because there's no return address on the stack.
-        //
-        // Let me use the CALL approach: push return address, thunk RETs back to us.
-
-        // CALL rel32: E8 xx xx xx xx (5 bytes)
-        // The CALL target is the start of the thunk code (5 bytes ahead).
-        // After the thunk RETs, execution continues after the thunk bytes.
-        let thunk_len = thunk.len() as i32;
+        let thunk_len = thunk.bytes.len() as i32;
         code.push(0xE8); // CALL rel32
-        // rel32 = distance from end of CALL instruction to start of thunk
-        // The thunk starts immediately after the 5-byte CALL + 5-byte JMP
         let jmp_size: i32 = 5;
         code.extend_from_slice(&jmp_size.to_le_bytes());
 
-        // JMP rel32 over the thunk bytes
         code.push(0xE9); // JMP rel32
         code.extend_from_slice(&thunk_len.to_le_bytes());
 
-        // Thunk code (complete, with RET and key data)
-        code.extend_from_slice(thunk);
+        let thunk_offset = code.len() as u64;
+        code.extend_from_slice(&thunk.bytes);
+        fixups.extend(thunk.fixups.iter().cloned().map(|fixup| RawCodeFixup {
+            offset: thunk_offset + fixup.offset,
+            target: match fixup.target {
+                RawCodeFixupTarget::FunctionAddress { offset } => {
+                    RawCodeFixupTarget::FunctionAddress {
+                        offset: thunk_offset + offset,
+                    }
+                }
+            },
+        }));
     }
 
-    // Jump to original entry point: mov rax, imm64; jmp rax
-    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    code.extend_from_slice(&original_entry.to_le_bytes());
-    code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+    // Compute the image load bias, then jump to the relocated original entry.
+    code.extend_from_slice(&[0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]); // lea rbx, [rip+0]
+    let anchor_offset = code.len() as u64;
+    code.extend_from_slice(&[0x48, 0xBA]); // mov rdx, imm64
+    let anchor_fixup_offset = code.len() as u64;
+    code.extend_from_slice(&0u64.to_le_bytes());
+    fixups.push(RawCodeFixup {
+        offset: anchor_fixup_offset,
+        target: RawCodeFixupTarget::FunctionAddress {
+            offset: anchor_offset,
+        },
+    });
+    code.extend_from_slice(&[0x48, 0x29, 0xD3]); // sub rbx, rdx
 
-    code
+    code.extend_from_slice(&[0x49, 0xBB]); // mov r11, imm64
+    code.extend_from_slice(&original_entry.to_le_bytes());
+    code.extend_from_slice(&[0x49, 0x01, 0xDB]); // add r11, rbx
+
+    code.push(0x5A); // pop rdx
+    code.push(0x5B); // pop rbx
+    code.push(0x58); // pop rax
+    code.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11
+
+    RawCodeBlob { bytes: code, fixups }
 }
 
 /// Wrap thunk code bytes into a `Function` with a single `RawBytes` instruction.
-fn make_thunk_function(name: &str, code: &[u8]) -> Function {
+fn make_thunk_function(name: &str, code: &RawCodeBlob) -> Function {
     let instr = Instruction {
         address: 0,
-        original_bytes: code.to_vec(),
-        opcode: Opcode::RawBytes(code.to_vec()),
+        original_bytes: code.bytes.clone(),
+        opcode: Opcode::RawBytes(code.bytes.clone()),
         operands: vec![],
         operand_size: OperandSize::Byte,
         data_refs: vec![],
@@ -430,8 +459,9 @@ fn make_thunk_function(name: &str, code: &[u8]) -> Function {
         terminator: Terminator::Return,
     };
 
-    let mut func = Function::new(name.into(), 0, code.len() as u64);
+    let mut func = Function::new(name.into(), 0, code.bytes.len() as u64);
     func.blocks.push(block);
+    func.raw_fixups = code.fixups.clone();
     func
 }
 
@@ -485,13 +515,14 @@ mod tests {
     #[test]
     fn test_thunk_generation() {
         let key = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let thunk = generate_thunk(0x400000, 4, &key);
+        let thunk = generate_thunk_with_fixups(0x400000, 4, &key);
 
-        assert!(!thunk.is_empty());
+        assert!(!thunk.bytes.is_empty());
         // The key bytes should appear at the end of the thunk.
-        assert_eq!(&thunk[thunk.len() - 4..], &key);
+        assert_eq!(&thunk.bytes[thunk.bytes.len() - 4..], &key);
         // Should end with the key bytes preceded by a RET (0xC3).
-        assert_eq!(thunk[thunk.len() - 4 - 1], 0xC3);
+        assert_eq!(thunk.bytes[thunk.bytes.len() - 4 - 1], 0xC3);
+        assert_eq!(thunk.fixups.len(), 1);
     }
 
     /// Thunk contains the string vaddr encoded as a little-endian u64.
@@ -792,5 +823,14 @@ mod tests {
         assert_eq!(thunk[thunk.len() - 1], 0xFF);
         // RET before key.
         assert_eq!(thunk[thunk.len() - 2], 0xC3);
+    }
+
+    #[test]
+    fn test_init_function_carries_fixups() {
+        let thunk = generate_thunk_with_fixups(0x401000, 4, &[1, 2, 3, 4]);
+        let init = generate_init_function_with_fixups(&[thunk], 0x402000);
+
+        assert!(!init.bytes.is_empty());
+        assert_eq!(init.fixups.len(), 2);
     }
 }

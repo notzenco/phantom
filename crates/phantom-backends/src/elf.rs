@@ -1,6 +1,6 @@
 use tracing::{debug, trace, warn};
 
-use phantom_core::ir::function::Function;
+use phantom_core::ir::function::{Function, RawCodeFixupTarget};
 use phantom_core::ir::instruction::Opcode;
 use phantom_core::ir::module::{BinaryMetadata, Module, SectionHeader};
 use phantom_disasm::IcedEncoder;
@@ -64,7 +64,8 @@ impl Backend for ElfBackend {
         // 2. Patch existing functions.
         for &idx in &existing_func_indices {
             let func = &module.functions[idx];
-            let encoded = re_encode_function(func, bitness)?;
+            let mut encoded = re_encode_function(func, bitness)?;
+            apply_raw_fixups(&mut encoded, func, func.address)?;
 
             let original_size = func.size as usize;
 
@@ -205,7 +206,8 @@ impl Backend for ElfBackend {
                 func_offsets.push((idx, func_addr));
 
                 // Re-encode with the new base address.
-                let encoded = re_encode_function_at(func, bitness, func_addr)?;
+                let mut encoded = re_encode_function_at(func, bitness, func_addr)?;
+                apply_raw_fixups(&mut encoded, func, func_addr)?;
                 new_code.extend_from_slice(&encoded);
 
                 debug!(
@@ -324,6 +326,34 @@ fn re_encode_function_impl(
     }
 
     Ok(result)
+}
+
+/// Apply backend raw code fixups for injected bytecode functions.
+fn apply_raw_fixups(
+    encoded: &mut [u8],
+    func: &Function,
+    function_addr: u64,
+) -> Result<(), BackendError> {
+    for fixup in &func.raw_fixups {
+        let offset = fixup.offset as usize;
+        let end = offset + 8;
+        if end > encoded.len() {
+            return Err(BackendError::Emit(format!(
+                "Raw fixup for function {} at offset {:#x} exceeds encoded size {:#x}",
+                func.name,
+                offset,
+                encoded.len()
+            )));
+        }
+
+        let value = match fixup.target {
+            RawCodeFixupTarget::FunctionAddress { offset } => function_addr + offset,
+        };
+
+        encoded[offset..end].copy_from_slice(&value.to_le_bytes());
+    }
+
+    Ok(())
 }
 
 /// Re-encode a single modified instruction using iced-x86.
@@ -528,6 +558,7 @@ fn bitness_for_module(module: &Module) -> u32 {
 mod tests {
     use super::*;
     use phantom_core::ir::block::{BasicBlock, BlockId, Terminator};
+    use phantom_core::ir::function::RawCodeFixup;
     use phantom_core::ir::instruction::{Instruction, InstructionMeta, Opcode};
     use phantom_core::ir::module::{
         DataSection, Module, ProgramHeader, SectionHeader, SectionPermissions,
@@ -822,6 +853,21 @@ mod tests {
         // Raw bytes should be written at offset 0x1000.
         assert_eq!(&result[0x1000..0x1003], &raw_data[..]);
         assert_eq!(result[0x1003], 0xC3); // RET
+    }
+
+    #[test]
+    fn test_raw_fixups_patch_function_address() {
+        let mut func = phantom_core::ir::function::Function::new("raw_fn".into(), 0x401000, 16);
+        func.raw_fixups.push(RawCodeFixup {
+            offset: 4,
+            target: RawCodeFixupTarget::FunctionAddress { offset: 12 },
+        });
+
+        let mut encoded = vec![0u8; 16];
+        apply_raw_fixups(&mut encoded, &func, 0x500000).unwrap();
+
+        let patched = u64::from_le_bytes(encoded[4..12].try_into().unwrap());
+        assert_eq!(patched, 0x50000c);
     }
 
     #[test]

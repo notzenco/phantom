@@ -8,7 +8,7 @@ pub mod pipeline;
 pub use error::PhantomError;
 pub use ir::{
     block::{BasicBlock, BlockId, CallTarget, Terminator},
-    function::Function,
+    function::{Function, RawCodeFixup, RawCodeFixupTarget},
     instruction::{Instruction, InstructionMeta, Opcode},
     module::{BinaryMetadata, DataSection, Module, ProgramHeader, Relocation, SectionHeader, SectionPermissions},
     types::{DataRef, ImmValue, MemOperand, Operand, OperandSize, PhysReg, VReg},

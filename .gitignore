@@ -1,5 +1,8 @@
 /target
 Cargo.lock
+/tests/fixtures/bin/
+/tests/fixtures/protected/
+/tests/fixtures/reports/
 *.swp
 *.swo
 *~
