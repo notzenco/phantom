@@ -18,14 +18,6 @@ use phantom_core::PhantomError;
 /// Information about a string reference found in the IR.
 #[derive(Debug, Clone)]
 struct StringRef {
-    /// Index of the function containing this reference.
-    func_idx: usize,
-    /// Index of the block within that function.
-    block_idx: usize,
-    /// Index of the instruction within that block.
-    instr_idx: usize,
-    /// Index of the data_ref within the instruction.
-    _data_ref_idx: usize,
     /// Virtual address of the referenced string data.
     vaddr: u64,
     /// Size of the string data (including any null terminator).
@@ -41,8 +33,6 @@ struct EncryptedString {
     len: usize,
     /// XOR key used to encrypt.
     key: Vec<u8>,
-    /// Name of the generated decryptor thunk function.
-    thunk_name: String,
 }
 
 /// A transform pass that encrypts string literals in data sections using XOR
@@ -103,34 +93,33 @@ impl Pass for StringEncryptionPass {
         // Step 2: Encrypt strings in data sections and generate thunk metadata.
         let encrypted = encrypt_strings(module, &unique_vaddrs, self.seed)?;
 
-        // Build a map from vaddr -> encrypted info for quick lookup.
-        let enc_map: HashMap<u64, &EncryptedString> =
-            encrypted.iter().map(|e| (e.vaddr, e)).collect();
-
-        // Step 3: Generate decryptor thunk functions and append to module.
+        // Step 3: Generate per-string decryptor thunk functions.
+        let mut thunk_codes: Vec<Vec<u8>> = Vec::new();
         for enc in &encrypted {
             let thunk_code = generate_thunk(enc.vaddr, enc.len, &enc.key);
-            let thunk_fn = make_thunk_function(&enc.thunk_name, &thunk_code);
             debug!(
-                "Generated decryptor thunk '{}' ({} bytes) for string at {:#x}",
-                enc.thunk_name,
+                "Generated decryptor thunk ({} bytes) for string at {:#x}",
                 thunk_code.len(),
                 enc.vaddr,
             );
-            module.functions.push(thunk_fn);
+            thunk_codes.push(thunk_code);
         }
 
-        // Step 4: Patch original LEA instructions that reference encrypted strings.
-        let mut patched = 0usize;
-        for sref in &string_refs {
-            if let Some(enc) = enc_map.get(&sref.vaddr) {
-                let instr = &mut module.functions[sref.func_idx].blocks[sref.block_idx]
-                    .instructions[sref.instr_idx];
-                patch_instruction(instr, enc);
-                patched += 1;
-            }
-        }
-        info!("Patched {patched} instruction(s) to call decryptor thunks.");
+        // Step 4: Generate a single __phantom_init function that:
+        //   - Calls each decryptor thunk sequentially
+        //   - Jumps to the original entry point
+        // The backend assigns addresses and redirects the ELF entry point.
+        let original_entry = module.metadata.entry_point;
+        let init_code = generate_init_function(&thunk_codes, original_entry);
+        let init_fn = make_thunk_function("__phantom_init", &init_code);
+        module.functions.push(init_fn);
+
+        info!(
+            "Generated __phantom_init ({} bytes) wrapping {} decryptor thunk(s), entry={:#x}",
+            init_code.len(),
+            thunk_codes.len(),
+            original_entry,
+        );
 
         Ok(())
     }
@@ -143,16 +132,12 @@ impl Pass for StringEncryptionPass {
 /// Walk every function/block/instruction and collect string DataRef entries.
 fn collect_string_refs(module: &Module) -> Vec<StringRef> {
     let mut refs = Vec::new();
-    for (fi, func) in module.functions.iter().enumerate() {
-        for (bi, block) in func.blocks.iter().enumerate() {
-            for (ii, instr) in block.instructions.iter().enumerate() {
-                for (di, dref) in instr.data_refs.iter().enumerate() {
+    for func in &module.functions {
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                for dref in &instr.data_refs {
                     if dref.is_string {
                         refs.push(StringRef {
-                            func_idx: fi,
-                            block_idx: bi,
-                            instr_idx: ii,
-                            _data_ref_idx: di,
                             vaddr: dref.vaddr,
                             size: dref.size,
                         });
@@ -216,12 +201,10 @@ fn encrypt_strings(
         // Encrypt in-place.
         xor_in_place(&mut section.data[offset..offset + size], &key);
 
-        let thunk_name = format!("__phantom_decrypt_{vaddr:x}");
         encrypted.push(EncryptedString {
             vaddr,
             len: size,
             key,
-            thunk_name,
         });
 
         debug!("Encrypted {size} bytes at {vaddr:#x} in section '{}'", section.name);
@@ -341,6 +324,88 @@ pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u
     code
 }
 
+/// Generate the __phantom_init function that inlines all decryptor thunks
+/// and then jumps to the original entry point.
+///
+/// Layout:
+///   [thunk_0 code (without its trailing RET)] [thunk_1 code ...] ... [jmp original_entry]
+///
+/// Each thunk is self-contained: it saves/restores registers and decrypts one string.
+/// We inline them sequentially (replacing each RET with the next thunk) and end
+/// with a jump to the original entry point.
+pub fn generate_init_function(thunk_codes: &[Vec<u8>], original_entry: u64) -> Vec<u8> {
+    let mut code = Vec::new();
+
+    // Inline each thunk. Each thunk ends with RET (0xC3) followed by key data.
+    // We include the full thunk (including RET and key data) and use CALL rel32
+    // to invoke each one, since the thunks are position-independent and we don't
+    // know their absolute addresses at this point.
+    //
+    // Simpler approach: just concatenate all thunk bytes as-is (each is a complete
+    // function with push/pop/ret). Then we use relative CALLs to invoke them.
+    //
+    // Even simpler: since each thunk is position-independent and self-contained,
+    // we CALL each one using relative addressing. But the addresses aren't known
+    // until the backend assigns them.
+    //
+    // Simplest working approach: inline the decryption loops directly without
+    // the register saves/restores (since we control the whole init sequence).
+    // Actually, let's keep it really simple: emit all thunks inline, then jmp.
+
+    // Save all callee-saved registers (we're the entry point, no caller to save for,
+    // but we need a clean state for the real entry).
+    // Actually, at program entry, registers are in an undefined state (except RSP
+    // and a few set by the kernel), so we just need to preserve RSP.
+
+    for thunk in thunk_codes {
+        // Each thunk is: [push regs] [decrypt loop] [mov rax, addr] [pop regs] [ret] [key data]
+        // We want everything except the RET. Find the RET byte that precedes the key data.
+        // The key data starts after the last RET (0xC3). We need the full thunk
+        // including key data for the LEA [rip+offset] to work.
+        //
+        // Actually, each thunk's LEA uses RIP-relative addressing to find its key.
+        // If we inline it, the RIP offsets still work because we include the key data.
+        // We just need to skip the RET and continue to next thunk.
+        //
+        // Find the RET: it's the 0xC3 byte before the key data. The key starts at
+        // a known offset. Let's just include the full thunk and convert RET to a
+        // 2-byte JMP over the key data to reach the next thunk.
+        //
+        // This is getting complex. Simplest approach: CALL each thunk as a subroutine.
+        // Emit: CALL +5 (to thunk code) / JMP past thunk / thunk bytes
+        // But that requires knowing thunk size.
+        //
+        // OK, simplest of all: just include each complete thunk inline. The RET will
+        // return to... nowhere useful because there's no return address on the stack.
+        //
+        // Let me use the CALL approach: push return address, thunk RETs back to us.
+
+        // CALL rel32: E8 xx xx xx xx (5 bytes)
+        // The CALL target is the start of the thunk code (5 bytes ahead).
+        // After the thunk RETs, execution continues after the thunk bytes.
+        let thunk_len = thunk.len() as i32;
+        code.push(0xE8); // CALL rel32
+        // rel32 = distance from end of CALL instruction to start of thunk
+        // The thunk starts immediately after the 5-byte CALL + 5-byte JMP
+        let jmp_size: i32 = 5;
+        code.extend_from_slice(&jmp_size.to_le_bytes());
+
+        // JMP rel32 over the thunk bytes
+        code.push(0xE9); // JMP rel32
+        code.extend_from_slice(&thunk_len.to_le_bytes());
+
+        // Thunk code (complete, with RET and key data)
+        code.extend_from_slice(thunk);
+    }
+
+    // Jump to original entry point: mov rax, imm64; jmp rax
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    code.extend_from_slice(&original_entry.to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+
+    code
+}
+
 /// Wrap thunk code bytes into a `Function` with a single `RawBytes` instruction.
 fn make_thunk_function(name: &str, code: &[u8]) -> Function {
     let instr = Instruction {
@@ -370,32 +435,6 @@ fn make_thunk_function(name: &str, code: &[u8]) -> Function {
     func
 }
 
-// ---------------------------------------------------------------------------
-// Step 4: Instruction patching
-// ---------------------------------------------------------------------------
-
-/// Patch an instruction that referenced an encrypted string.
-///
-/// Changes the opcode from `Lea` to `Call` with a `Named` target pointing to
-/// the decryptor thunk. The backend is responsible for resolving the call
-/// address and re-encoding the instruction.
-fn patch_instruction(instr: &mut Instruction, enc: &EncryptedString) {
-    instr.opcode = Opcode::Call;
-    instr.meta.modified = true;
-    instr.meta.modified_by = Some("string_encryption".into());
-
-    // We don't rewrite original_bytes here — the backend handles re-encoding
-    // modified instructions. We store the thunk name so the backend can resolve
-    // the call target.
-    //
-    // NOTE: The instruction's data_refs are left intact so the backend can see
-    // which string was being referenced. The `Opcode::Call` with a named
-    // target signals that this needs special handling.
-    debug!(
-        "Patched instruction at {:#x} → CALL {}",
-        instr.address, enc.thunk_name
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -583,25 +622,21 @@ mod tests {
             "String data should be encrypted"
         );
 
-        // Verify: a decryptor thunk function was added.
-        let thunk_name = format!("__phantom_decrypt_{string_vaddr:x}");
+        // Verify: a __phantom_init function was added.
         assert!(
-            module.function(&thunk_name).is_some(),
-            "Decryptor thunk function should exist"
+            module.function("__phantom_init").is_some(),
+            "Init function should exist"
         );
 
-        // Verify: the original LEA instruction was patched to a Call.
+        // Verify: the original LEA instruction is NOT modified (entry-point
+        // redirection is used instead of LEA patching).
         let main_fn = module.function("main").unwrap();
         let first_instr = &main_fn.blocks[0].instructions[0];
         assert!(
-            matches!(first_instr.opcode, Opcode::Call),
-            "LEA should have been patched to CALL"
+            matches!(first_instr.opcode, Opcode::Lea),
+            "LEA should remain unmodified"
         );
-        assert!(first_instr.meta.modified);
-        assert_eq!(
-            first_instr.meta.modified_by.as_deref(),
-            Some("string_encryption")
-        );
+        assert!(!first_instr.meta.modified);
     }
 
     /// Verify that with a seed, the pass is deterministic.
@@ -715,20 +750,20 @@ mod tests {
 
         pass.run(&mut module).unwrap();
 
-        // Should only have 1 thunk (deduped) + 1 original function.
-        let thunk_count = module
-            .functions
-            .iter()
-            .filter(|f| f.name.starts_with("__phantom_decrypt_"))
-            .count();
-        assert_eq!(thunk_count, 1, "Only one thunk per unique vaddr");
+        // Should have __phantom_init + original function (no per-string thunks).
+        assert!(
+            module.function("__phantom_init").is_some(),
+            "Init function should exist"
+        );
+        // There should be exactly 2 functions: main + __phantom_init.
+        assert_eq!(module.functions.len(), 2);
 
-        // Both LEA instructions should be patched.
+        // LEA instructions should remain unmodified.
         let main_fn = module.function("main").unwrap();
         for instr in &main_fn.blocks[0].instructions {
             assert!(
-                matches!(instr.opcode, Opcode::Call),
-                "Both instructions should be patched to CALL"
+                matches!(instr.opcode, Opcode::Lea),
+                "LEA instructions should remain unmodified"
             );
         }
     }

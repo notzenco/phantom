@@ -110,6 +110,7 @@ impl Backend for ElfBackend {
         }
 
         // 3. Patch data sections.
+        let mut modified_section_vaddrs = Vec::new();
         for ds in &module.data_sections {
             let offset = ds.file_offset as usize;
             let end = offset + ds.data.len();
@@ -125,12 +126,58 @@ impl Backend for ElfBackend {
             // Only write if data differs from original.
             if binary[offset..end] != ds.data[..] {
                 binary[offset..end].copy_from_slice(&ds.data);
+                modified_section_vaddrs.push(ds.vaddr);
                 debug!(
                     section = %ds.name,
                     offset = %format!("{:#x}", offset),
                     size = ds.data.len(),
                     "Patched data section"
                 );
+            }
+        }
+
+        // 3b. Make segments containing modified data sections writable.
+        // This is needed because decryptor thunks decrypt strings in-place at runtime,
+        // and read-only segments (e.g., .rodata) would cause a segfault.
+        if !modified_section_vaddrs.is_empty() {
+            let e_phoff = read_u64_le(&binary, 32) as usize;
+            let e_phnum = read_u16_le(&binary, 56) as usize;
+
+            for i in 0..e_phnum {
+                let phdr_offset = e_phoff + i * PHDR64_SIZE;
+                if phdr_offset + PHDR64_SIZE > binary.len() {
+                    break;
+                }
+                let p_type = u32::from_le_bytes(
+                    binary[phdr_offset..phdr_offset + 4].try_into().unwrap(),
+                );
+                if p_type != PT_LOAD {
+                    continue;
+                }
+                let p_vaddr = read_u64_le(&binary, phdr_offset + 16);
+                let p_memsz = read_u64_le(&binary, phdr_offset + 40);
+
+                for &sec_vaddr in &modified_section_vaddrs {
+                    if sec_vaddr >= p_vaddr && sec_vaddr < p_vaddr + p_memsz {
+                        // Add PF_W (0x2) to the segment flags.
+                        let p_flags_offset = phdr_offset + 4;
+                        let flags = u32::from_le_bytes(
+                            binary[p_flags_offset..p_flags_offset + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        if flags & 0x2 == 0 {
+                            let new_flags = flags | 0x2;
+                            binary[p_flags_offset..p_flags_offset + 4]
+                                .copy_from_slice(&new_flags.to_le_bytes());
+                            debug!(
+                                segment_vaddr = %format!("{:#x}", p_vaddr),
+                                "Made segment writable for runtime decryption"
+                            );
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -171,6 +218,19 @@ impl Backend for ElfBackend {
 
             if !new_code.is_empty() {
                 append_new_segment(&mut binary, &new_code, load_addr, &module.metadata)?;
+            }
+
+            // If there's a __phantom_init function, redirect the entry point to it.
+            for &(idx, addr) in &func_offsets {
+                if module.functions[idx].name == "__phantom_init" {
+                    debug!(
+                        old_entry = %format!("{:#x}", module.metadata.entry_point),
+                        new_entry = %format!("{:#x}", addr),
+                        "Redirecting entry point to __phantom_init"
+                    );
+                    // e_entry is at offset 24 in a 64-bit ELF header.
+                    write_u64_le(&mut binary, 24, addr);
+                }
             }
         }
 
@@ -249,7 +309,7 @@ fn re_encode_function_impl(
             } else if let Some(iced_code) = insn.meta.iced_code {
                 // Modified with iced metadata: re-encode.
                 let rip = (insn.address as i64 + addr_delta) as u64;
-                re_encode_modified_instruction(insn, iced_code, rip, &encoder)?
+                re_encode_modified_instruction(insn, iced_code, rip, &encoder, bitness)?
             } else {
                 // Modified but no iced metadata — fall back to original bytes.
                 warn!(
@@ -275,6 +335,7 @@ fn re_encode_modified_instruction(
     _iced_code: u16,
     rip: u64,
     encoder: &IcedEncoder,
+    bitness: u32,
 ) -> Result<Vec<u8>, BackendError> {
     // Decode the original bytes to reconstruct the iced_x86::Instruction.
     // We use the original bytes as a base and then apply modifications.
@@ -282,7 +343,7 @@ fn re_encode_modified_instruction(
     // pointing to a new address). The iced instruction carries the displacement,
     // so we decode the original, update the displacement if a RipRelative operand
     // changed, and re-encode.
-    let disasm = phantom_disasm::IcedDisassembler::new(if rip > u32::MAX as u64 { 64 } else { 32 });
+    let disasm = phantom_disasm::IcedDisassembler::new(bitness);
     let decoded = disasm.decode_all(&insn.original_bytes, insn.address)?;
 
     if decoded.is_empty() {
@@ -314,7 +375,12 @@ fn nop_pad(buf: &mut Vec<u8>, target_len: usize) {
     }
 }
 
-/// Append a new PT_LOAD segment to the binary for new code.
+/// Append new code to the binary by creating a new PT_LOAD segment.
+///
+/// Strategy to find room for the new phdr (in order of preference):
+/// 1. Space after existing phdrs (gap before first section)
+/// 2. Overwrite a PT_NOTE phdr (not needed for execution)
+/// 3. Error if neither option works
 fn append_new_segment(
     binary: &mut Vec<u8>,
     code: &[u8],
@@ -337,7 +403,6 @@ fn append_new_segment(
         "Appended new code segment"
     );
 
-    // Create PT_LOAD program header.
     let phdr = build_phdr(
         PT_LOAD,
         PF_RX,
@@ -349,41 +414,35 @@ fn append_new_segment(
         PAGE_ALIGN,
     );
 
-    // Find where to insert the new phdr.
-    // The program header table starts at e_phoff.
-    let e_phoff = read_u64_le(binary, 32);
-    let e_phnum = read_u16_le(binary, 56);
+    let e_phoff = read_u64_le(binary, 32) as usize;
+    let e_phnum = read_u16_le(binary, 56) as usize;
+    let phdr_table_end = e_phoff + e_phnum * PHDR64_SIZE;
 
-    let phdr_table_end = e_phoff as usize + (e_phnum as usize) * PHDR64_SIZE;
-
-    // Check if there's room to insert in-place (between end of phdrs and start of first section).
-    // Find the earliest section/data after the phdr table.
+    // Strategy 1: Space after existing phdrs.
     let first_content_offset = find_first_content_after(binary, phdr_table_end, metadata);
-
     if phdr_table_end + PHDR64_SIZE <= first_content_offset {
-        // Room to insert in-place.
         binary[phdr_table_end..phdr_table_end + PHDR64_SIZE].copy_from_slice(&phdr);
-    } else {
-        // No room — append the phdr at the end.
-        // This is unusual but we update e_phoff to point to the new location.
-        let new_phoff = binary.len() as u64;
-
-        // Copy existing phdrs.
-        let existing_phdrs_start = e_phoff as usize;
-        let existing_phdrs_end = phdr_table_end;
-        let existing = binary[existing_phdrs_start..existing_phdrs_end].to_vec();
-
-        binary.extend_from_slice(&existing);
-        binary.extend_from_slice(&phdr);
-
-        // Update e_phoff.
-        write_u64_le(binary, 32, new_phoff);
+        write_u16_le(binary, 56, (e_phnum + 1) as u16);
+        debug!("Added new PT_LOAD program header in-place");
+        return Ok(());
     }
 
-    // Update e_phnum.
-    write_u16_le(binary, 56, e_phnum + 1);
+    // Strategy 2: Overwrite a PT_NOTE phdr (type 4). Notes are informational
+    // and not required for execution.
+    let pt_note: u32 = 4;
+    for i in 0..e_phnum {
+        let off = e_phoff + i * PHDR64_SIZE;
+        let p_type = u32::from_le_bytes(binary[off..off + 4].try_into().unwrap());
+        if p_type == pt_note {
+            binary[off..off + PHDR64_SIZE].copy_from_slice(&phdr);
+            debug!("Overwrote PT_NOTE phdr at index {} with new PT_LOAD", i);
+            return Ok(());
+        }
+    }
 
-    Ok(())
+    Err(BackendError::Emit(
+        "No room for new program header: no space after phdrs and no PT_NOTE to overwrite".into(),
+    ))
 }
 
 /// Build a 64-bit ELF program header as raw bytes.
