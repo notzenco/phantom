@@ -1,0 +1,11 @@
+[package]
+name = "phantom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core IR definitions, pass trait, and pipeline for Phantom code protector"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
