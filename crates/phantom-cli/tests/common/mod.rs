@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -19,20 +20,25 @@ pub struct Target {
     pub mode: String,
     pub suffix: String,
     pub runner: Vec<String>,
+    /// Environment the runner needs (e.g. silencing Wine diagnostics on stderr).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     pub bin_dir: PathBuf,
 }
 
 impl Target {
     /// Command that executes `binary` on this host (directly or via e.g. Wine).
     pub fn command(&self, binary: &Path) -> Command {
-        match self.runner.split_first() {
+        let mut command = match self.runner.split_first() {
             Some((program, rest)) => {
                 let mut command = Command::new(program);
                 command.args(rest).arg(binary);
                 command
             }
             None => Command::new(binary),
-        }
+        };
+        command.envs(&self.env);
+        command
     }
 }
 
@@ -59,11 +65,14 @@ struct Manifest {
     demo: Vec<Demo>,
 }
 
-fn repo_root() -> PathBuf {
+// Not `canonicalize`: on Windows it yields a `\\?\` verbatim path that MinGW gcc
+// cannot open.
+pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("resolve repo root")
+        .ancestors()
+        .nth(2)
+        .expect("crate lives two levels below the repo root")
+        .to_path_buf()
 }
 
 fn fixtures_root() -> PathBuf {

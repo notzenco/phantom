@@ -2,17 +2,9 @@
 
 mod common;
 
-use std::path::Path;
 use std::process::Command;
 
-use common::{temp_path, BIN};
-
-fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("resolve repo root")
-}
+use common::{repo_root, temp_path, BIN};
 
 #[test]
 #[cfg_attr(

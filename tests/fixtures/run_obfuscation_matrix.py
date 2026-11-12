@@ -68,9 +68,11 @@ def phantom_command(args: argparse.Namespace, input_path: Path, output_path: Pat
     ]
 
 
-def run_command(command: list[str], cwd: Path) -> tuple[int, str, str, float]:
+def run_command(
+    command: list[str], cwd: Path, env: dict[str, str] | None = None
+) -> tuple[int, str, str, float]:
     start = time.perf_counter()
-    proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=env)
     duration_ms = (time.perf_counter() - start) * 1000
     return proc.returncode, proc.stdout, proc.stderr, duration_ms
 
@@ -200,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 baseline_cmd = [*plan.runner, str(build_result.output), *case.args]
                 baseline_started = now_iso()
-                rc, stdout, stderr, duration_ms = run_command(baseline_cmd, build_fixtures.ROOT)
+                rc, stdout, stderr, duration_ms = run_command(baseline_cmd, build_fixtures.ROOT, plan.run_env())
                 baseline_failure = compare_behavior(case, rc, stdout, stderr)
                 if baseline_failure:
                     failure_count += 1
@@ -307,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
                 protected_cmd = [*plan.runner, str(protected_path), *case.args]
-                prc, pstdout, pstderr, protected_ms = run_command(protected_cmd, build_fixtures.ROOT)
+                prc, pstdout, pstderr, protected_ms = run_command(protected_cmd, build_fixtures.ROOT, plan.run_env())
                 protected_failure = compare_behavior(case, prc, pstdout, pstderr)
                 if protected_failure:
                     failure_count += 1
