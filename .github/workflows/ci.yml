@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    # The integration matrix compiles the fixture corpus for every target the host
+    # can execute and runs the protected binaries. PHANTOM_REQUIRE_TARGETS turns a
+    # missing toolchain into a failure instead of a silent skip.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: static,dynamic,pe
+          - os: windows-latest
+            targets: pe
+          - os: macos-latest
+            targets: ""
+    runs-on: ${{ matrix.os }}
+    env:
+      PHANTOM_REQUIRE_TARGETS: ${{ matrix.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install MinGW and Wine
+        if: runner.os == 'Linux'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 wine wine64
+      - run: cargo test --workspace --locked --no-fail-fast
+      - name: Obfuscation matrix report
+        if: always() && matrix.targets != ''
+        run: python tests/fixtures/run_obfuscation_matrix.py --mode all --json-out matrix-report.json
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.targets != ''
+        with:
+          name: obfuscation-matrix-${{ runner.os }}
+          path: matrix-report.json
+          if-no-files-found: ignore

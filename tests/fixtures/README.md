@@ -6,7 +6,7 @@ This directory contains the manifest-driven demo corpus used by Phantom's integr
 
 - `manifest.toml`: Source of truth for demos, expected outputs, exit codes, and plaintext probes.
 - `src/`: C source files for each demo program.
-- `build_fixtures.py`: Builds the demo corpus into `bin/static/` and `bin/dynamic/`.
+- `build_fixtures.py`: Builds the demo corpus into `bin/<target>/` for every target this host can execute: `static` and `dynamic` (x86-64 Linux ELF), and `pe` (Windows, via MinGW; run under Wine on Linux). `--list` prints those targets as JSON for the Rust tests.
 - `build_fixtures.sh`: Thin compatibility wrapper around the Python builder.
 - `run_obfuscation_matrix.py`: Builds, protects, executes, string-scans, and writes a JSON report.
 - `bin/`, `protected/`, `reports/`: Generated artifact directories ignored by git.

@@ -16,7 +16,7 @@ Encrypts all detected string literals in data sections using XOR with random key
 
 ### How it works
 
-1. Scan instructions for DataRefs marked as strings
+1. Collect DataRefs marked as strings, from instructions and from `Module::data_refs` (pointer tables in data)
 2. XOR-encrypt string bytes in-place in data sections
 3. Generate per-string decryptor thunks (self-contained x86-64 machine code)
 4. Attach backend-patchable raw fixups to injected code so final addresses can be resolved after layout

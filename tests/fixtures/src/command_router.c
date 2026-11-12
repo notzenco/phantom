@@ -13,7 +13,9 @@ static const char *route_for(int command) {
     }
 }
 
-int main(void) {
-    printf("route:%s\n", route_for(7));
+int main(int argc, char **argv) {
+    (void)argv;
+    // Routing by argc keeps every case live under optimisation.
+    printf("route:%s\n", route_for(8 - argc));
     return 0;
 }

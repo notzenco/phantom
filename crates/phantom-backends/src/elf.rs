@@ -1,9 +1,13 @@
-use tracing::{debug, trace, warn};
+use tracing::debug;
 
-use phantom_core::ir::function::{Function, RawCodeFixupTarget};
-use phantom_core::ir::instruction::Opcode;
 use phantom_core::ir::module::{BinaryMetadata, Module, SectionHeader};
-use phantom_disasm::IcedEncoder;
+
+use crate::common::{
+    align_up, encode_new_functions, patch_data_sections, patch_existing_functions, read_u16_le,
+    read_u64_le, write_u16_le, write_u64_le, NewCode,
+};
+#[cfg(test)]
+use crate::common::{apply_raw_fixups, bitness_for_module, nop_pad};
 
 use crate::error::BackendError;
 use crate::Backend;
@@ -40,8 +44,6 @@ impl Backend for ElfBackend {
             return Err(BackendError::NoRawBinary);
         }
         let mut binary = module.raw_binary.clone();
-        let bitness = bitness_for_module(module);
-
         debug!(
             functions = module.functions.len(),
             data_sections = module.data_sections.len(),
@@ -62,80 +64,12 @@ impl Backend for ElfBackend {
         }
 
         // 2. Patch existing functions.
-        for &idx in &existing_func_indices {
-            let func = &module.functions[idx];
-            let mut encoded = re_encode_function(func, bitness)?;
-            apply_raw_fixups(&mut encoded, func, func.address)?;
-
-            let original_size = func.size as usize;
-
-            if encoded.len() > original_size {
-                return Err(BackendError::FunctionGrew {
-                    name: func.name.clone(),
-                    addr: func.address,
-                    original: original_size,
-                    new: encoded.len(),
-                });
-            }
-
-            let file_offset = vaddr_to_file_offset(module, func.address).ok_or_else(|| {
-                BackendError::Emit(format!(
-                    "Cannot map function {} at {:#x} to file offset",
-                    func.name, func.address
-                ))
-            })?;
-
-            let offset = file_offset as usize;
-
-            // Write re-encoded bytes.
-            let mut padded = encoded;
-            nop_pad(&mut padded, original_size);
-
-            if offset + padded.len() > binary.len() {
-                return Err(BackendError::Emit(format!(
-                    "Function {} at offset {:#x} extends beyond binary (size {:#x})",
-                    func.name,
-                    offset,
-                    binary.len()
-                )));
-            }
-
-            binary[offset..offset + padded.len()].copy_from_slice(&padded);
-            trace!(
-                func = %func.name,
-                addr = %format!("{:#x}", func.address),
-                file_offset = %format!("{:#x}", offset),
-                encoded_size = padded.len(),
-                "Patched existing function"
-            );
-        }
+        patch_existing_functions(module, &mut binary, &existing_func_indices, |vaddr| {
+            vaddr_to_file_offset(module, vaddr)
+        })?;
 
         // 3. Patch data sections.
-        let mut modified_section_vaddrs = Vec::new();
-        for ds in &module.data_sections {
-            let offset = ds.file_offset as usize;
-            let end = offset + ds.data.len();
-
-            if end > binary.len() {
-                warn!(
-                    section = %ds.name,
-                    "Data section extends beyond binary, skipping"
-                );
-                continue;
-            }
-
-            // Only write if data differs from original.
-            if binary[offset..end] != ds.data[..] {
-                binary[offset..end].copy_from_slice(&ds.data);
-                modified_section_vaddrs.push(ds.vaddr);
-                debug!(
-                    section = %ds.name,
-                    offset = %format!("{:#x}", offset),
-                    size = ds.data.len(),
-                    "Patched data section"
-                );
-            }
-        }
+        let modified_section_vaddrs = patch_data_sections(module, &mut binary);
 
         // 3b. Make segments containing modified data sections writable.
         // This is needed because decryptor thunks decrypt strings in-place at runtime,
@@ -149,9 +83,8 @@ impl Backend for ElfBackend {
                 if phdr_offset + PHDR64_SIZE > binary.len() {
                     break;
                 }
-                let p_type = u32::from_le_bytes(
-                    binary[phdr_offset..phdr_offset + 4].try_into().unwrap(),
-                );
+                let p_type =
+                    u32::from_le_bytes(binary[phdr_offset..phdr_offset + 4].try_into().unwrap());
                 if p_type != PT_LOAD {
                     continue;
                 }
@@ -196,27 +129,10 @@ impl Backend for ElfBackend {
 
             let load_addr = align_up(highest_end, PAGE_ALIGN);
 
-            // Encode all new functions sequentially at the chosen load address.
-            let mut new_code = Vec::new();
-            let mut func_offsets: Vec<(usize, u64)> = Vec::new(); // (func index, assigned vaddr)
-
-            for &idx in &new_func_indices {
-                let func = &module.functions[idx];
-                let func_addr = load_addr + new_code.len() as u64;
-                func_offsets.push((idx, func_addr));
-
-                // Re-encode with the new base address.
-                let mut encoded = re_encode_function_at(func, bitness, func_addr)?;
-                apply_raw_fixups(&mut encoded, func, func_addr)?;
-                new_code.extend_from_slice(&encoded);
-
-                debug!(
-                    func = %func.name,
-                    addr = %format!("{:#x}", func_addr),
-                    size = encoded.len(),
-                    "Encoded new function"
-                );
-            }
+            let NewCode {
+                code: new_code,
+                placed: func_offsets,
+            } = encode_new_functions(module, &new_func_indices, load_addr)?;
 
             if !new_code.is_empty() {
                 append_new_segment(&mut binary, &new_code, load_addr, &module.metadata)?;
@@ -258,151 +174,6 @@ fn section_for_vaddr(module: &Module, vaddr: u64) -> Option<&SectionHeader> {
         .section_headers
         .iter()
         .find(|sh| vaddr >= sh.sh_addr && vaddr < sh.sh_addr + sh.sh_size)
-}
-
-/// Re-encode a function using its original addresses.
-///
-/// For each instruction:
-/// - Unmodified instructions use `original_bytes` directly (safest).
-/// - Modified instructions with `iced_code` are re-encoded via IcedEncoder.
-/// - `RawBytes` opcodes use the bytes from the variant.
-fn re_encode_function(func: &Function, bitness: u32) -> Result<Vec<u8>, BackendError> {
-    re_encode_function_impl(func, bitness, None)
-}
-
-/// Re-encode a function at a specific base address (for new functions).
-fn re_encode_function_at(
-    func: &Function,
-    bitness: u32,
-    base_addr: u64,
-) -> Result<Vec<u8>, BackendError> {
-    re_encode_function_impl(func, bitness, Some(base_addr))
-}
-
-/// Core re-encoding implementation.
-///
-/// If `base_addr` is Some, all instructions are offset from that base.
-/// If None, instructions keep their original addresses.
-fn re_encode_function_impl(
-    func: &Function,
-    bitness: u32,
-    base_addr: Option<u64>,
-) -> Result<Vec<u8>, BackendError> {
-    let encoder = IcedEncoder::new(bitness);
-    let mut result = Vec::new();
-
-    // Sort blocks by start_addr to ensure correct ordering.
-    let mut blocks: Vec<_> = func.blocks.iter().collect();
-    blocks.sort_by_key(|b| b.start_addr);
-
-    // Compute offset from original function address to new base (if any).
-    let addr_delta = base_addr
-        .map(|ba| ba as i64 - func.address as i64)
-        .unwrap_or(0);
-
-    for block in blocks {
-        for insn in &block.instructions {
-            let bytes = if !insn.meta.modified {
-                // Unmodified: pass through original bytes.
-                insn.original_bytes.clone()
-            } else if let Opcode::RawBytes(ref raw) = insn.opcode {
-                // RawBytes: use the stored bytes.
-                raw.clone()
-            } else if let Some(iced_code) = insn.meta.iced_code {
-                // Modified with iced metadata: re-encode.
-                let rip = (insn.address as i64 + addr_delta) as u64;
-                re_encode_modified_instruction(insn, iced_code, rip, &encoder, bitness)?
-            } else {
-                // Modified but no iced metadata — fall back to original bytes.
-                warn!(
-                    addr = %format!("{:#x}", insn.address),
-                    "Modified instruction without iced_code, using original bytes"
-                );
-                insn.original_bytes.clone()
-            };
-
-            result.extend_from_slice(&bytes);
-        }
-    }
-
-    Ok(result)
-}
-
-/// Apply backend raw code fixups for injected bytecode functions.
-fn apply_raw_fixups(
-    encoded: &mut [u8],
-    func: &Function,
-    function_addr: u64,
-) -> Result<(), BackendError> {
-    for fixup in &func.raw_fixups {
-        let offset = fixup.offset as usize;
-        let end = offset + 8;
-        if end > encoded.len() {
-            return Err(BackendError::Emit(format!(
-                "Raw fixup for function {} at offset {:#x} exceeds encoded size {:#x}",
-                func.name,
-                offset,
-                encoded.len()
-            )));
-        }
-
-        let value = match fixup.target {
-            RawCodeFixupTarget::FunctionAddress { offset } => function_addr + offset,
-        };
-
-        encoded[offset..end].copy_from_slice(&value.to_le_bytes());
-    }
-
-    Ok(())
-}
-
-/// Re-encode a single modified instruction using iced-x86.
-///
-/// Decodes the original bytes to get the iced instruction, then re-encodes at the
-/// target RIP. This lets BlockEncoder handle RIP-relative fixups correctly.
-fn re_encode_modified_instruction(
-    insn: &phantom_core::ir::instruction::Instruction,
-    _iced_code: u16,
-    rip: u64,
-    encoder: &IcedEncoder,
-    bitness: u32,
-) -> Result<Vec<u8>, BackendError> {
-    // Decode the original bytes to reconstruct the iced_x86::Instruction.
-    // We use the original bytes as a base and then apply modifications.
-    // For Phase 1, the primary modification is to data references (e.g., LEA
-    // pointing to a new address). The iced instruction carries the displacement,
-    // so we decode the original, update the displacement if a RipRelative operand
-    // changed, and re-encode.
-    let disasm = phantom_disasm::IcedDisassembler::new(bitness);
-    let decoded = disasm.decode_all(&insn.original_bytes, insn.address)?;
-
-    if decoded.is_empty() {
-        return Err(BackendError::Encode(format!(
-            "Failed to decode instruction at {:#x} for re-encoding",
-            insn.address
-        )));
-    }
-
-    let mut iced_insn = decoded[0].instruction;
-
-    // Apply operand modifications. Check for RipRelative operands that indicate
-    // the target address changed.
-    for op in &insn.operands {
-        if let phantom_core::ir::types::Operand::RipRelative(target_addr) = op {
-            // Update the memory displacement to the new target.
-            iced_insn.set_memory_displacement64(*target_addr);
-        }
-    }
-
-    let bytes = encoder.encode_instruction(&iced_insn, rip)?;
-    Ok(bytes)
-}
-
-/// Pad a byte buffer with NOP (0x90) instructions to reach `target_len`.
-fn nop_pad(buf: &mut Vec<u8>, target_len: usize) {
-    while buf.len() < target_len {
-        buf.push(0x90);
-    }
 }
 
 /// Append new code to the binary by creating a new PT_LOAD segment.
@@ -518,47 +289,11 @@ fn find_first_content_after(
     earliest
 }
 
-/// Read a little-endian u64 from binary at the given offset.
-fn read_u64_le(binary: &[u8], offset: usize) -> u64 {
-    let bytes: [u8; 8] = binary[offset..offset + 8].try_into().unwrap();
-    u64::from_le_bytes(bytes)
-}
-
-/// Read a little-endian u16 from binary at the given offset.
-fn read_u16_le(binary: &[u8], offset: usize) -> u16 {
-    let bytes: [u8; 2] = binary[offset..offset + 2].try_into().unwrap();
-    u16::from_le_bytes(bytes)
-}
-
-/// Write a little-endian u64 to binary at the given offset.
-fn write_u64_le(binary: &mut [u8], offset: usize, value: u64) {
-    binary[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-/// Write a little-endian u16 to binary at the given offset.
-fn write_u16_le(binary: &mut [u8], offset: usize, value: u16) {
-    binary[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-/// Align a value up to the given alignment (must be a power of two).
-fn align_up(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) & !(alignment - 1)
-}
-
-/// Determine bitness from the module's architecture.
-fn bitness_for_module(module: &Module) -> u32 {
-    match module.arch {
-        phantom_core::Architecture::X86_64 => 64,
-        phantom_core::Architecture::X86 => 32,
-        _ => 64, // Default to 64-bit.
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use phantom_core::ir::block::{BasicBlock, BlockId, Terminator};
-    use phantom_core::ir::function::RawCodeFixup;
+    use phantom_core::ir::function::{RawCodeFixup, RawCodeFixupTarget};
     use phantom_core::ir::instruction::{Instruction, InstructionMeta, Opcode};
     use phantom_core::ir::module::{
         DataSection, Module, ProgramHeader, SectionHeader, SectionPermissions,
@@ -711,7 +446,7 @@ mod tests {
         // Check that NOP and RET were written at offset 0x1000.
         assert_eq!(result[0x1000], 0x90); // NOP
         assert_eq!(result[0x1001], 0xC3); // RET
-        // Remaining 3 bytes should be NOP-padded.
+                                          // Remaining 3 bytes should be NOP-padded.
         assert_eq!(result[0x1002], 0x90);
         assert_eq!(result[0x1003], 0x90);
         assert_eq!(result[0x1004], 0x90);
@@ -787,7 +522,9 @@ mod tests {
 
     #[test]
     fn test_build_phdr() {
-        let phdr = build_phdr(PT_LOAD, PF_RX, 0x3000, 0x600000, 0x600000, 0x100, 0x100, 0x1000);
+        let phdr = build_phdr(
+            PT_LOAD, PF_RX, 0x3000, 0x600000, 0x600000, 0x100, 0x100, 0x1000,
+        );
         assert_eq!(phdr.len(), PHDR64_SIZE);
 
         // Verify p_type.
@@ -795,25 +532,16 @@ mod tests {
         // Verify p_flags.
         assert_eq!(u32::from_le_bytes(phdr[4..8].try_into().unwrap()), PF_RX);
         // Verify p_offset.
-        assert_eq!(
-            u64::from_le_bytes(phdr[8..16].try_into().unwrap()),
-            0x3000
-        );
+        assert_eq!(u64::from_le_bytes(phdr[8..16].try_into().unwrap()), 0x3000);
         // Verify p_vaddr.
         assert_eq!(
             u64::from_le_bytes(phdr[16..24].try_into().unwrap()),
             0x600000
         );
         // Verify p_filesz.
-        assert_eq!(
-            u64::from_le_bytes(phdr[32..40].try_into().unwrap()),
-            0x100
-        );
+        assert_eq!(u64::from_le_bytes(phdr[32..40].try_into().unwrap()), 0x100);
         // Verify p_align.
-        assert_eq!(
-            u64::from_le_bytes(phdr[48..56].try_into().unwrap()),
-            0x1000
-        );
+        assert_eq!(u64::from_le_bytes(phdr[48..56].try_into().unwrap()), 0x1000);
     }
 
     #[test]
@@ -904,6 +632,6 @@ mod tests {
 
     #[test]
     fn test_default_trait() {
-        let _backend = ElfBackend::default();
+        let _backend = ElfBackend;
     }
 }

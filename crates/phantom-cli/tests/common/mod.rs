@@ -9,19 +9,29 @@ use serde::Deserialize;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_phantom-cli");
 
-const MODES: [LinkMode; 2] = [LinkMode::Static, LinkMode::Dynamic];
+/// Python 3 launcher name; Windows installs ship `python`, not `python3`.
+pub const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkMode {
-    Static,
-    Dynamic,
+/// A fixture target this host can build and execute, as reported by
+/// `build_fixtures.py --list`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Target {
+    pub mode: String,
+    pub suffix: String,
+    pub runner: Vec<String>,
+    pub bin_dir: PathBuf,
 }
 
-impl LinkMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Static => "static",
-            Self::Dynamic => "dynamic",
+impl Target {
+    /// Command that executes `binary` on this host (directly or via e.g. Wine).
+    pub fn command(&self, binary: &Path) -> Command {
+        match self.runner.split_first() {
+            Some((program, rest)) => {
+                let mut command = Command::new(program);
+                command.args(rest).arg(binary);
+                command
+            }
+            None => Command::new(binary),
         }
     }
 }
@@ -70,10 +80,11 @@ fn build_script_path() -> PathBuf {
 
 static BUILD_STATUS: OnceLock<Result<(), String>> = OnceLock::new();
 static MANIFEST: OnceLock<Vec<Demo>> = OnceLock::new();
+static TARGETS: OnceLock<Vec<Target>> = OnceLock::new();
 
 fn ensure_fixtures_built() {
     let status = BUILD_STATUS.get_or_init(|| {
-        let output = Command::new("python3")
+        let output = Command::new(PYTHON)
             .arg(build_script_path())
             .args(["--mode", "all", "--quiet"])
             .current_dir(repo_root())
@@ -109,18 +120,49 @@ pub fn demos() -> &'static [Demo] {
         .as_slice()
 }
 
-pub fn modes() -> &'static [LinkMode] {
-    &MODES
+/// Targets this host can build and run. Set `PHANTOM_REQUIRE_TARGETS` (comma
+/// separated) to fail instead of silently skipping a target CI must cover.
+pub fn targets() -> &'static [Target] {
+    TARGETS
+        .get_or_init(|| {
+            let output = Command::new(PYTHON)
+                .arg(build_script_path())
+                .arg("--list")
+                .output()
+                .expect("run fixture target listing");
+            assert!(
+                output.status.success(),
+                "fixture target listing failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let targets: Vec<Target> =
+                serde_json::from_slice(&output.stdout).expect("parse fixture target listing");
+            if let Ok(required) = std::env::var("PHANTOM_REQUIRE_TARGETS") {
+                for mode in required.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+                    assert!(
+                        targets.iter().any(|t| t.mode == mode),
+                        "required fixture target '{mode}' is not available on this host"
+                    );
+                }
+            }
+            if targets.is_empty() {
+                eprintln!("no fixture targets can run on this host; skipping matrix");
+            }
+            targets
+        })
+        .as_slice()
 }
 
-pub fn fixture_binary(demo: &Demo, mode: LinkMode) -> PathBuf {
+pub fn fixture_binary(demo: &Demo, target: &Target) -> PathBuf {
     let source_path = fixtures_root().join(&demo.source);
     assert!(
         source_path.exists(),
         "fixture source should exist: {}",
         source_path.display()
     );
-    fixtures_root().join("bin").join(mode.as_str()).join(&demo.name)
+    target
+        .bin_dir
+        .join(format!("{}{}", demo.name, target.suffix))
 }
 
 pub fn temp_path(name: &str) -> PathBuf {
@@ -131,6 +173,11 @@ pub fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("phantom-{name}-{unique}"))
 }
 
+/// Windows C runtimes write CRLF in text mode; the manifest records LF.
+fn normalized(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace("\r\n", "\n")
+}
+
 pub fn assert_case_output(case: &DemoCase, output: &Output, context: &str) {
     assert_eq!(
         output.status.code(),
@@ -139,12 +186,12 @@ pub fn assert_case_output(case: &DemoCase, output: &Output, context: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
+        normalized(&output.stdout),
         case.expect_stdout,
         "{context}: unexpected stdout"
     );
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
+        normalized(&output.stderr),
         case.expect_stderr,
         "{context}: unexpected stderr"
     );
@@ -168,7 +215,11 @@ pub fn protect_binary(input: &Path, output: &Path, profile: Option<&str>) -> Out
 pub fn probe_hits(bytes: &[u8], probes: &[String]) -> Vec<String> {
     probes
         .iter()
-        .filter(|probe| bytes.windows(probe.len()).any(|window| window == probe.as_bytes()))
+        .filter(|probe| {
+            bytes
+                .windows(probe.len())
+                .any(|window| window == probe.as_bytes())
+        })
         .cloned()
         .collect()
 }

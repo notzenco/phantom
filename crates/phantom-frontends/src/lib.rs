@@ -1,8 +1,11 @@
 pub mod elf;
 pub mod error;
+pub mod pe;
+mod x86;
 
 pub use elf::ElfFrontend;
 pub use error::FrontendError;
+pub use pe::PeFrontend;
 
 use phantom_core::ir::module::Module;
 
@@ -19,6 +22,10 @@ pub fn detect_frontend(data: &[u8]) -> Option<Box<dyn Frontend>> {
     let elf = ElfFrontend::new();
     if elf.can_handle(data) {
         return Some(Box::new(elf));
+    }
+    let pe = PeFrontend::new();
+    if pe.can_handle(data) {
+        return Some(Box::new(pe));
     }
     None
 }

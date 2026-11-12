@@ -152,6 +152,12 @@ fn collect_string_refs(module: &Module) -> Vec<StringRef> {
             }
         }
     }
+    for dref in module.data_refs.iter().filter(|d| d.is_string) {
+        refs.push(StringRef {
+            vaddr: dref.vaddr,
+            size: dref.size,
+        });
+    }
     refs
 }
 
@@ -187,9 +193,7 @@ fn encrypt_strings(
 
     for &(vaddr, size) in unique {
         let section = module.data_section_for_addr_mut(vaddr).ok_or_else(|| {
-            PhantomError::Pass(format!(
-                "No data section contains string at {vaddr:#x}"
-            ))
+            PhantomError::Pass(format!("No data section contains string at {vaddr:#x}"))
         })?;
 
         let offset = (vaddr - section.vaddr) as usize;
@@ -213,7 +217,10 @@ fn encrypt_strings(
             key,
         });
 
-        debug!("Encrypted {size} bytes at {vaddr:#x} in section '{}'", section.name);
+        debug!(
+            "Encrypted {size} bytes at {vaddr:#x} in section '{}'",
+            section.name
+        );
     }
 
     Ok(encrypted)
@@ -258,11 +265,7 @@ pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u
 
 #[allow(clippy::vec_init_then_push)]
 fn generate_thunk_with_fixups(string_vaddr: u64, string_len: usize, key: &[u8]) -> RawCodeBlob {
-    assert_eq!(
-        key.len(),
-        string_len,
-        "key length must equal string length"
-    );
+    assert_eq!(key.len(), string_len, "key length must equal string length");
 
     let mut code = Vec::new();
     let mut fixups = Vec::new();
@@ -351,7 +354,10 @@ fn generate_thunk_with_fixups(string_vaddr: u64, string_len: usize, key: &[u8]) 
     let disp = (ret_pos as i32) - (lea_next_ip as i32);
     code[lea_pos + 3..lea_pos + 7].copy_from_slice(&disp.to_le_bytes());
 
-    RawCodeBlob { bytes: code, fixups }
+    RawCodeBlob {
+        bytes: code,
+        fixups,
+    }
 }
 
 /// Generate the __phantom_init function that inlines all decryptor thunks
@@ -397,7 +403,7 @@ fn generate_init_function_with_fixups(
 
         let thunk_offset = code.len() as u64;
         code.extend_from_slice(&thunk.bytes);
-        fixups.extend(thunk.fixups.iter().cloned().map(|fixup| RawCodeFixup {
+        fixups.extend(thunk.fixups.iter().map(|fixup| RawCodeFixup {
             offset: thunk_offset + fixup.offset,
             target: match fixup.target {
                 RawCodeFixupTarget::FunctionAddress { offset } => {
@@ -432,7 +438,10 @@ fn generate_init_function_with_fixups(
     code.push(0x58); // pop rax
     code.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11
 
-    RawCodeBlob { bytes: code, fixups }
+    RawCodeBlob {
+        bytes: code,
+        fixups,
+    }
 }
 
 /// Wrap thunk code bytes into a `Function` with a single `RawBytes` instruction.
@@ -465,7 +474,6 @@ fn make_thunk_function(name: &str, code: &RawCodeBlob) -> Function {
     func
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -481,7 +489,9 @@ mod tests {
     #[test]
     fn test_xor_roundtrip() {
         let original = b"Hello, World!\0";
-        let key: Vec<u8> = (0..original.len()).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let key: Vec<u8> = (0..original.len())
+            .map(|i| (i as u8).wrapping_mul(37))
+            .collect();
 
         let encrypted = xor_bytes(original, &key);
         assert_ne!(&encrypted, original);
@@ -534,9 +544,7 @@ mod tests {
 
         let vaddr_bytes = vaddr.to_le_bytes();
         // The vaddr should appear at least once (in the mov rsi, imm64).
-        assert!(thunk
-            .windows(8)
-            .any(|w| w == vaddr_bytes));
+        assert!(thunk.windows(8).any(|w| w == vaddr_bytes));
     }
 
     /// Pass metadata is correct.
@@ -724,8 +732,7 @@ mod tests {
         StringEncryptionPass::with_seed(9999).run(&mut m2).unwrap();
 
         assert_eq!(
-            m1.data_sections[0].data,
-            m2.data_sections[0].data,
+            m1.data_sections[0].data, m2.data_sections[0].data,
             "Same seed should produce identical ciphertext"
         );
     }
@@ -811,6 +818,38 @@ mod tests {
 
         xor_in_place(&mut data, &key);
         assert_eq!(data, original);
+    }
+
+    /// Strings reached only through a pointer stored in data (e.g. a lookup table)
+    /// are encrypted too.
+    #[test]
+    fn test_encrypts_strings_referenced_from_data() {
+        let string_data = b"vermilion\0";
+        let string_vaddr: u64 = 0x600000;
+        let mut module = Module::new("table".into(), Architecture::X86_64, BinaryFormat::Elf);
+        module.data_sections.push(DataSection {
+            name: ".rodata".into(),
+            vaddr: string_vaddr,
+            file_offset: 0x2000,
+            data: string_data.to_vec(),
+            permissions: SectionPermissions {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            relocations: vec![],
+        });
+        module.data_refs.push(DataRef {
+            vaddr: string_vaddr,
+            size: string_data.len(),
+            data: string_data.to_vec(),
+            is_string: true,
+        });
+
+        StringEncryptionPass::with_seed(7).run(&mut module).unwrap();
+
+        assert_ne!(&module.data_sections[0].data[..], string_data);
+        assert!(module.function("__phantom_init").is_some());
     }
 
     /// Thunk for a single-byte string is generated correctly.

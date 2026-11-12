@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tracing::info;
 
-use phantom_backends::{Backend, ElfBackend};
+use phantom_backends::backend_for;
 use phantom_core::pipeline::Pipeline;
 use phantom_frontends::detect_frontend;
 
@@ -53,7 +53,8 @@ pub fn run(args: &ProtectArgs) -> Result<()> {
     }
 
     info!("Emitting protected binary...");
-    let backend = ElfBackend::new();
+    let backend = backend_for(module.format)
+        .ok_or_else(|| anyhow::anyhow!("No emitter for {:?} binaries", module.format))?;
     let binary = backend.emit(&module)?;
 
     std::fs::write(&args.output, &binary)?;

@@ -22,6 +22,13 @@ expect_stdout = "lookup:amber\n"
 expect_stderr = ""
 expect_exit = 0
 
+[[demo.case]]
+name = "third_entry"
+args = ["x"]
+expect_stdout = "lookup:vermilion\n"
+expect_stderr = ""
+expect_exit = 0
+
 [[demo]]
 name = "command_router"
 source = "src/command_router.c"
@@ -31,6 +38,13 @@ string_probes = ["route:%s", "north-east", "south-hold", "west-gate"]
 name = "default"
 args = []
 expect_stdout = "route:north-east\n"
+expect_stderr = ""
+expect_exit = 0
+
+[[demo.case]]
+name = "south"
+args = ["a", "b"]
+expect_stdout = "route:south-hold\n"
 expect_stderr = ""
 expect_exit = 0
 
