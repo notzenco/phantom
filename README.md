@@ -200,6 +200,30 @@ At runtime, init runs first, decrypts all strings in-place, then transfers contr
 
 In-place decryption needs the string pages to be writable at runtime. On macOS, C string literals live in `__TEXT,__cstring`, inside the code-signed `__TEXT` segment, and the kernel refuses to make it writable: `mprotect` fails, and raising the segment's max protection either still fails (x86-64) or stops the binary from launching (arm64). Mach-O support therefore needs a different design: move encrypted strings into a new writable segment and rewrite their references, then re-sign the binary.
 
+## Results
+
+From the fixture matrix (10 C programs, 13 behaviour cases, each built for every target):
+
+| Target | Cases passing after protection | Probe strings hidden | Size overhead (`banner_messages`) |
+|--------|-------------------------------|----------------------|-----------------------------------|
+| Linux ELF, static | 13/13 | All | +16.5% |
+| Linux ELF, PIE | 13/13 | All | +5.4% |
+| Windows PE (Wine and native Windows) | 13/13 | All | +1.4% |
+
+Every probe is checked to be present in the unprotected binary first, so "hidden" cannot pass by the compiler having removed the string. Static binaries carry the most overhead because libc's own strings are encrypted too, each with its own ~90-byte decryptor stub.
+
+## Security Model and Limitations
+
+String encryption raises the cost of casual static analysis: `strings`, grep, and quick looks in a disassembler no longer reveal messages, format strings or lookup tables. It is not a defence against a determined analyst:
+
+- **Eager decryption.** `__phantom_init` decrypts every string before the original entry point runs, so a memory dump taken any time after start-up shows all plaintext.
+- **Keys ship with the binary.** Each string is XORed with a random per-string key stored next to its decryptor, so the original bytes can be recovered statically or by emulating the init routine.
+- **Writable read-only data.** Sections holding encrypted strings (`.rodata`, `.rdata`) stay writable for the life of the process, which weakens the usual hardening of constant data.
+- **Coverage is heuristic.** Only printable ASCII strings reached by a RIP-relative instruction or a pointer stored in data are found. UTF-16 strings (`L"..."`) and strings built at runtime are not, and on PE, functions without unwind info (some MSVC leaf functions) are not lifted.
+- **Signatures are lost.** Protected PE files have their Authenticode signature removed and must be re-signed.
+
+Planned mitigations: restore read-only protection after decryption, decrypt on first use instead of at start-up, and replace per-string stubs with one table-driven decryptor to cut the static-binary overhead.
+
 ## Fixture Corpus
 
 The repository includes a manifest-driven demo corpus under `tests/fixtures` for exercising protection against small real programs rather than a single hello-world sample.
@@ -239,10 +263,11 @@ python3 ./tests/fixtures/run_obfuscation_matrix.py --mode all
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 1 - Foundation | ELF lift/emit, string encryption, CLI | Done |
-| 3a - Windows | PE32+ lift/emit, Windows CI | Done |
-| 2 - Obfuscation Suite | CFG flattening, opaque predicates, dead code injection, protection profiles | Planned |
-| 3 - Cross-Platform + Source | Mach-O, arm64; JS and Python frontends; source-level IR | Planned |
+| 1 - Foundation | ELF lift/emit, string encryption, protection profiles, CLI | Done |
+| 2 - Obfuscation Suite | CFG flattening, opaque predicates, dead code injection | Planned |
+| 3a - Windows | PE32+ lift/emit, cross-platform CI | Done |
+| 3b - macOS and arm64 | Mach-O via relocated strings and re-signing; arm64 lifting and codegen | Planned |
+| 3c - Source frontends | JS and Python frontends; source-level IR | Planned |
 | 4 - VM Virtualizer | Custom bytecode ISA, bytecode compiler, interpreter generator, ISA randomization | Planned |
 | 5 - Packing & Anti-Analysis | Section encryption, import hiding, anti-debug, anti-tamper, integrity checks | Planned |
 | 6 - GUI | Tauri v2 + Next.js desktop app with profile editor, IR inspector, protection dashboard | Planned |
