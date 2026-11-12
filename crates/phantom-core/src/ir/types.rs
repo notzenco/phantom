@@ -124,7 +124,10 @@ mod tests {
         assert_eq!(ImmValue::Imm8(0xff).value(), 255);
         assert_eq!(ImmValue::Imm16(0x1234).value(), 0x1234);
         assert_eq!(ImmValue::Imm32(0xdeadbeef).value(), 0xdeadbeef);
-        assert_eq!(ImmValue::Imm64(0x123456789abcdef0).value(), 0x123456789abcdef0);
+        assert_eq!(
+            ImmValue::Imm64(0x123456789abcdef0).value(),
+            0x123456789abcdef0
+        );
     }
 
     #[test]

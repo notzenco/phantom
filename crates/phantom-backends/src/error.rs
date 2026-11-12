@@ -8,7 +8,9 @@ pub enum BackendError {
     Encode(String),
     #[error("No raw binary in module")]
     NoRawBinary,
-    #[error("Function {name} at {addr:#x} grew from {original} to {new} bytes — too large to patch")]
+    #[error(
+        "Function {name} at {addr:#x} grew from {original} to {new} bytes — too large to patch"
+    )]
     FunctionGrew {
         name: String,
         addr: u64,

@@ -1,6 +1,4 @@
-use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, InstructionBlock,
-};
+use iced_x86::{BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, InstructionBlock};
 use tracing::trace;
 
 use crate::DisasmError;
@@ -209,8 +207,7 @@ mod tests {
     fn encode_single() {
         // Manually construct: mov rax, rbx using iced_x86's factory
         let insn =
-            iced_x86::Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBX)
-                .unwrap();
+            iced_x86::Instruction::with2(Code::Mov_r64_rm64, Register::RAX, Register::RBX).unwrap();
 
         let encoder = IcedEncoder::new(64);
         let bytes = encoder.encode_instruction(&insn, 0x1000).unwrap();

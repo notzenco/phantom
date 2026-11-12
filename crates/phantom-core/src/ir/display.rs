@@ -154,7 +154,11 @@ impl fmt::Display for Instruction {
 
 impl fmt::Display for BasicBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "  block_{} ({:016x}..{:016x}):", self.id.0, self.start_addr, self.end_addr)?;
+        writeln!(
+            f,
+            "  block_{} ({:016x}..{:016x}):",
+            self.id.0, self.start_addr, self.end_addr
+        )?;
         for instr in &self.instructions {
             writeln!(f, "    {instr}")?;
         }

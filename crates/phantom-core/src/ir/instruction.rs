@@ -180,7 +180,10 @@ mod tests {
         ];
         for op in &non_jumps {
             assert!(!op.is_jump(), "{op:?} should not be a jump");
-            assert!(!op.is_conditional_jump(), "{op:?} should not be conditional");
+            assert!(
+                !op.is_conditional_jump(),
+                "{op:?} should not be conditional"
+            );
         }
     }
 
