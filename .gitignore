@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 /tests/fixtures/bin/
 /tests/fixtures/protected/
 /tests/fixtures/reports/
@@ -7,3 +6,4 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+__pycache__/
