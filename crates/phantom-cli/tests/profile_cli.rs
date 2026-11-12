@@ -15,6 +15,10 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    ignore = "compiles and executes an x86-64 Linux PIE"
+)]
 fn protect_dynamic_pie_profile_hides_strings_and_runs() {
     let source = temp_path("dynamic-pie").with_extension("c");
     let input = temp_path("dynamic-pie");
@@ -116,14 +120,17 @@ fn profiles_command_lists_builtin_and_file_profiles() {
 
 #[test]
 fn obfuscation_matrix_script_emits_json_report() {
+    if common::targets().is_empty() {
+        return;
+    }
     let report = temp_path("obfuscation-matrix").with_extension("json");
     let script = repo_root().join("tests/fixtures/run_obfuscation_matrix.py");
 
-    let result = Command::new("python3")
+    let result = Command::new(common::PYTHON)
         .arg(script)
         .args([
             "--mode",
-            "dynamic",
+            "all",
             "--json-out",
             report.to_str().expect("utf8 report path"),
         ])

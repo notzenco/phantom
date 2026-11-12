@@ -6,7 +6,13 @@ Binary emitters that produce protected executables from Phantom IR.
 
 The backend uses **patch-based emission** — it starts from the original binary bytes (`module.raw_binary`) and patches in modifications. This preserves the original linker layout, section alignment, and metadata.
 
-## Emission Pipeline
+Encoding and patching shared by every format live in `common.rs`; `backend_for(format)` picks the emitter.
+
+## PE Emission
+
+`PeBackend` patches functions and data in place, marks sections holding encrypted data writable, appends injected code as a `.phantom` section placed right after the last section (Windows requires contiguous sections), redirects `AddressOfEntryPoint`, strips any Authenticode signature, and recomputes the image checksum.
+
+## ELF Emission Pipeline
 
 1. **Patch existing functions** — Re-encode modified instructions, NOP-pad if smaller, error if larger
 2. **Patch data sections** — Write modified data (e.g., encrypted strings) back to file offsets
@@ -22,9 +28,9 @@ Injected code fixups allow the same pass-generated raw machine code to work for 
 ## Usage
 
 ```rust
-use phantom_backends::{Backend, ElfBackend};
+use phantom_backends::backend_for;
 
-let backend = ElfBackend::new();
+let backend = backend_for(module.format).expect("no emitter for this format");
 let protected_bytes = backend.emit(&module)?;
 std::fs::write("protected", &protected_bytes)?;
 ```

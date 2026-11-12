@@ -20,6 +20,7 @@ Module
 │           ├── address, original_bytes, Opcode, Operand[]
 │           ├── DataRef[] (references to data sections)
 │           └── InstructionMeta (iced_code, modified flag)
+├── data_refs[] (strings reached through pointers stored in data)
 └── raw_binary (original file bytes for patch-based emission)
 ```
 

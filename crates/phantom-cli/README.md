@@ -6,7 +6,7 @@ Command-line interface for the Phantom code protector.
 
 ### `protect`
 
-Full pipeline: lift binary, apply transform passes, emit protected binary.
+Full pipeline: lift binary, apply transform passes, emit protected binary. Accepts x86-64 Linux ELF (static or PIE) and Windows PE executables; the format is detected from the file.
 
 ```sh
 phantom-cli protect -i <input> -o <output> [--profile <name>] [--profile-file <path>] [-p <pass1,pass2,...>]
@@ -71,7 +71,7 @@ The repository includes a manifest-driven demo corpus under `tests/fixtures`:
 python3 tests/fixtures/run_obfuscation_matrix.py --mode all
 ```
 
-The authoritative end-to-end integration tests for the CLI live in `crates/phantom-cli/tests` and use the same manifest and fixture builder.
+The authoritative end-to-end integration tests for the CLI live in `crates/phantom-cli/tests` and use the same manifest and fixture builder. They run every target the host can execute (`build_fixtures.py --list`); set `PHANTOM_REQUIRE_TARGETS` to make a missing target fail.
 
 ## Logging
 

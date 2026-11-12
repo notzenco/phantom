@@ -20,12 +20,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build, obfuscate, run, and report on Phantom demo fixtures")
     parser.add_argument(
         "--mode",
-        choices=("static", "dynamic", "all"),
+        choices=(*build_fixtures.MODES, "all"),
         default="all",
-        help="Which binary mode to exercise",
+        help="Which target to exercise; 'all' means every target this host can execute",
     )
     parser.add_argument("--profile", default="strings", help="Protection profile to pass to phantom-cli")
-    parser.add_argument("--compiler", default="gcc", help="C compiler to invoke during fixture builds")
+    parser.add_argument("--compiler", help="C compiler to invoke instead of the target default")
     parser.add_argument("--force-build", action="store_true", help="Force rebuilding fixture binaries")
     parser.add_argument(
         "--phantom-bin",
@@ -105,6 +105,9 @@ def stage_record(
 
 
 def compare_behavior(case, returncode: int, stdout: str, stderr: str) -> str | None:
+    # Windows C runtimes write CRLF in text mode; the manifest records LF.
+    stdout = stdout.replace("\r\n", "\n")
+    stderr = stderr.replace("\r\n", "\n")
     if returncode != case.expect_exit:
         return f"expected exit {case.expect_exit}, got {returncode}"
     if stdout != case.expect_stdout:
@@ -115,9 +118,10 @@ def compare_behavior(case, returncode: int, stdout: str, stderr: str) -> str | N
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     demos = build_fixtures.load_manifest()
     build_fixtures.ensure_directories()
+    plans = build_fixtures.selected_plans(args.mode, args.compiler)
 
     json_out = Path(args.json_out)
     json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     failure_count = 0
 
     for demo in demos:
-        for mode in build_fixtures.selected_modes(args.mode):
+        for plan in plans:
+            mode = plan.target.mode
             build_key = (demo.name, mode)
             build_started = now_iso()
             build_failure: str | None = None
@@ -137,8 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     build_cache[build_key] = build_fixtures.build_demo(
                         demo,
-                        mode,
-                        compiler=args.compiler,
+                        plan,
                         force=args.force_build,
                         quiet=True,
                     )
@@ -148,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                         demo=demo.name,
                         mode=mode,
                         output=build_fixtures.output_path(demo, mode),
-                        command=build_fixtures.build_command(demo, mode, args.compiler),
+                        command=build_fixtures.build_command(demo, plan),
                         rebuilt=True,
                     )
 
@@ -194,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[FAIL] {demo.name}/{case.name}/{mode}: build failed")
                     continue
 
-                baseline_cmd = [str(build_result.output), *case.args]
+                baseline_cmd = [*plan.runner, str(build_result.output), *case.args]
                 baseline_started = now_iso()
                 rc, stdout, stderr, duration_ms = run_command(baseline_cmd, build_fixtures.ROOT)
                 baseline_failure = compare_behavior(case, rc, stdout, stderr)
@@ -219,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 protect_key = build_key
                 protect_started = now_iso()
                 if protect_key not in protect_cache:
-                    protected_path = build_fixtures.PROTECTED_ROOT / mode / f"{demo.name}--{args.profile}"
+                    protected_path = build_fixtures.PROTECTED_ROOT / mode / f"{demo.name}--{args.profile}{plan.target.suffix}"
                     protect_cmd = phantom_command(args, build_result.output, protected_path)
                     protect_rc, protect_out, protect_err, protect_ms = run_command(
                         protect_cmd, build_fixtures.ROOT.parent.parent
@@ -302,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[FAIL] {demo.name}/{case.name}/{mode}: protect failed")
                     continue
 
-                protected_cmd = [str(protected_path), *case.args]
+                protected_cmd = [*plan.runner, str(protected_path), *case.args]
                 prc, pstdout, pstderr, protected_ms = run_command(protected_cmd, build_fixtures.ROOT)
                 protected_failure = compare_behavior(case, prc, pstdout, pstderr)
                 if protected_failure:

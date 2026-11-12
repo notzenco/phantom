@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::function::Function;
+use super::types::DataRef;
 use crate::{Architecture, BinaryFormat};
 
 /// Permission flags for a data section.
@@ -86,6 +87,10 @@ pub struct Module {
     pub data_sections: Vec<DataSection>,
     pub raw_binary: Vec<u8>,
     pub metadata: BinaryMetadata,
+    /// References to data reached through pointers stored in data (for example a
+    /// table of `const char *`) rather than through an instruction operand.
+    #[serde(default)]
+    pub data_refs: Vec<DataRef>,
 }
 
 impl Module {
@@ -104,6 +109,7 @@ impl Module {
                 section_headers: Vec::new(),
                 is_pie: false,
             },
+            data_refs: Vec::new(),
         }
     }
 
@@ -119,16 +125,16 @@ impl Module {
 
     /// Find the data section whose address range contains `addr`.
     pub fn data_section_for_addr(&self, addr: u64) -> Option<&DataSection> {
-        self.data_sections.iter().find(|s| {
-            addr >= s.vaddr && addr < s.vaddr + s.data.len() as u64
-        })
+        self.data_sections
+            .iter()
+            .find(|s| addr >= s.vaddr && addr < s.vaddr + s.data.len() as u64)
     }
 
     /// Find the data section mutably whose address range contains `addr`.
     pub fn data_section_for_addr_mut(&mut self, addr: u64) -> Option<&mut DataSection> {
-        self.data_sections.iter_mut().find(|s| {
-            addr >= s.vaddr && addr < s.vaddr + s.data.len() as u64
-        })
+        self.data_sections
+            .iter_mut()
+            .find(|s| addr >= s.vaddr && addr < s.vaddr + s.data.len() as u64)
     }
 }
 
@@ -152,7 +158,8 @@ mod tests {
     fn function_lookup() {
         let mut m = Module::new("test".into(), Architecture::X86_64, BinaryFormat::Elf);
         m.functions.push(Function::new("main".into(), 0x401000, 50));
-        m.functions.push(Function::new("helper".into(), 0x402000, 30));
+        m.functions
+            .push(Function::new("helper".into(), 0x402000, 30));
 
         assert!(m.function("main").is_some());
         assert!(m.function("helper").is_some());

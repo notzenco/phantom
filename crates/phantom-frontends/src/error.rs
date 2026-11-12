@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FrontendError {
-    #[error("ELF parse error: {0}")]
-    ElfParse(String),
+    #[error("Parse error: {0}")]
+    Parse(String),
     #[error("Unsupported binary format")]
     UnsupportedFormat,
     #[error("No executable code found")]
