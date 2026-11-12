@@ -10,7 +10,10 @@ pub use ir::{
     block::{BasicBlock, BlockId, CallTarget, Terminator},
     function::{Function, RawCodeFixup, RawCodeFixupTarget},
     instruction::{Instruction, InstructionMeta, Opcode},
-    module::{BinaryMetadata, DataSection, Module, ProgramHeader, Relocation, SectionHeader, SectionPermissions},
+    module::{
+        BinaryMetadata, DataSection, Module, ProgramHeader, Relocation, SectionHeader,
+        SectionPermissions,
+    },
     types::{DataRef, ImmValue, MemOperand, Operand, OperandSize, PhysReg, VReg},
 };
 pub use pass::{Pass, PassInfo};

@@ -7,8 +7,8 @@ use phantom_frontends::detect_frontend;
 pub fn run(input: &PathBuf) -> Result<()> {
     let data = std::fs::read(input)?;
 
-    let frontend = detect_frontend(&data)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported binary format"))?;
+    let frontend =
+        detect_frontend(&data).ok_or_else(|| anyhow::anyhow!("Unsupported binary format"))?;
 
     let module = frontend.lift(&data)?;
 
@@ -23,9 +23,15 @@ pub fn run(input: &PathBuf) -> Result<()> {
     println!("Data sections: {}", module.data_sections.len());
 
     for ds in &module.data_sections {
-        println!("  {} @ {:#x} ({} bytes, r={} w={} x={})",
-            ds.name, ds.vaddr, ds.data.len(),
-            ds.permissions.read, ds.permissions.write, ds.permissions.execute);
+        println!(
+            "  {} @ {:#x} ({} bytes, r={} w={} x={})",
+            ds.name,
+            ds.vaddr,
+            ds.data.len(),
+            ds.permissions.read,
+            ds.permissions.write,
+            ds.permissions.execute
+        );
     }
 
     Ok(())

@@ -57,7 +57,9 @@ impl Function {
 
     /// Iterate mutably over all instructions across all blocks.
     pub fn instructions_mut(&mut self) -> impl Iterator<Item = &mut Instruction> {
-        self.blocks.iter_mut().flat_map(|b| b.instructions.iter_mut())
+        self.blocks
+            .iter_mut()
+            .flat_map(|b| b.instructions.iter_mut())
     }
 
     /// Look up a block by its `BlockId`.

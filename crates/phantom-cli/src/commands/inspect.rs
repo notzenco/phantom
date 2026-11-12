@@ -7,8 +7,8 @@ use phantom_frontends::detect_frontend;
 pub fn run(input: &PathBuf, function: Option<&str>, json: bool) -> Result<()> {
     let data = std::fs::read(input)?;
 
-    let frontend = detect_frontend(&data)
-        .ok_or_else(|| anyhow::anyhow!("Unsupported binary format"))?;
+    let frontend =
+        detect_frontend(&data).ok_or_else(|| anyhow::anyhow!("Unsupported binary format"))?;
 
     let module = frontend.lift(&data)?;
 
