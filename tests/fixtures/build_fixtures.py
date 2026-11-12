@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -125,6 +126,10 @@ class HostPlan:
     target: Target
     compiler: str
     runner: tuple[str, ...]
+    env: dict[str, str] = dataclasses.field(default_factory=dict)
+
+    def run_env(self) -> dict[str, str]:
+        return {**os.environ, **self.env}
 
 
 def _machine() -> str:
@@ -140,6 +145,7 @@ def host_plan(mode: str, compiler_override: str | None = None) -> HostPlan | Non
     target = TARGETS[mode]
     x86_64 = _machine() in ("x86_64", "amd64")
     runner: tuple[str, ...] = ()
+    env: dict[str, str] = {}
 
     if mode in ("static", "dynamic"):
         if not (sys.platform.startswith("linux") and x86_64):
@@ -153,6 +159,9 @@ def host_plan(mode: str, compiler_override: str | None = None) -> HostPlan | Non
             if wine is None:
                 return None
             runner = (wine,)
+            # Headless Wine reports missing display drivers on stderr, which would
+            # break the exact stderr comparison.
+            env = {"WINEDEBUG": "-all"}
             compiler = _first_tool(("x86_64-w64-mingw32-gcc",))
         else:
             return None
@@ -162,7 +171,7 @@ def host_plan(mode: str, compiler_override: str | None = None) -> HostPlan | Non
     compiler = compiler_override or compiler
     if compiler is None:
         return None
-    return HostPlan(target=target, compiler=compiler, runner=runner)
+    return HostPlan(target=target, compiler=compiler, runner=runner, env=env)
 
 
 def available_modes(compiler_override: str | None = None) -> tuple[str, ...]:
@@ -272,7 +281,12 @@ def warm_up_runner(plan: HostPlan) -> None:
     """Wine creates its prefix on first use and reports that on stderr, which would
     otherwise pollute the first fixture's captured output."""
     if plan.runner:
-        subprocess.run([*plan.runner, "cmd", "/c", "exit"], capture_output=True, timeout=600)
+        subprocess.run(
+            [*plan.runner, "cmd", "/c", "exit"],
+            capture_output=True,
+            timeout=600,
+            env=plan.run_env(),
+        )
 
 
 def list_targets(compiler_override: str | None) -> str:
@@ -286,6 +300,7 @@ def list_targets(compiler_override: str | None) -> str:
                 "description": plan.target.description,
                 "suffix": plan.target.suffix,
                 "runner": list(plan.runner),
+                "env": plan.env,
                 "bin_dir": str(BIN_ROOT / mode),
             }
         )
