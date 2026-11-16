@@ -155,9 +155,7 @@ fn assign_terminators(
     // Build a map from address to DecodedInsn for quick lookup.
     let insn_map: HashMap<u64, &DecodedInsn> = decoded.iter().map(|d| (d.address, d)).collect();
 
-    let block_count = func.blocks.len();
-    for block_idx in 0..block_count {
-        let block = &func.blocks[block_idx];
+    for block in &mut func.blocks {
         let block_id = block.id;
         let block_end = block.end_addr;
 
@@ -231,7 +229,7 @@ fn assign_terminators(
             Terminator::Unreachable
         };
 
-        func.blocks[block_idx].terminator = terminator;
+        block.terminator = terminator;
     }
 }
 
