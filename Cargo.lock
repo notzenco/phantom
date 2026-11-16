@@ -263,7 +263,6 @@ dependencies = [
  "clap",
  "phantom-backends",
  "phantom-core",
- "phantom-disasm",
  "phantom-frontends",
  "phantom-passes",
  "serde",
@@ -287,7 +286,6 @@ name = "phantom-disasm"
 version = "0.1.0"
 dependencies = [
  "iced-x86",
- "phantom-core",
  "thiserror",
  "tracing",
 ]
@@ -310,7 +308,6 @@ version = "0.1.0"
 dependencies = [
  "phantom-core",
  "rand",
- "thiserror",
  "tracing",
 ]
 

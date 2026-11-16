@@ -7,6 +7,5 @@ description = "Transform passes (obfuscation, encryption, etc.) for Phantom"
 
 [dependencies]
 phantom-core.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
