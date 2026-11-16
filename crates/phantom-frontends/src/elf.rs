@@ -1,5 +1,5 @@
 use goblin::elf::{
-    header::{EM_386, EM_X86_64, ET_DYN},
+    header::{EM_X86_64, ET_DYN},
     reloc::R_X86_64_RELATIVE,
     sym::STT_FUNC,
     Elf,
@@ -49,17 +49,17 @@ impl Frontend for ElfFrontend {
 fn lift_elf(data: &[u8]) -> Result<Module, FrontendError> {
     let elf = Elf::parse(data).map_err(|e| FrontendError::Parse(e.to_string()))?;
 
-    let arch = match elf.header.e_machine {
-        EM_X86_64 => Architecture::X86_64,
-        EM_386 => Architecture::X86,
-        _ => return Err(FrontendError::UnsupportedFormat),
-    };
-
-    let bitness: u32 = match arch {
-        Architecture::X86_64 => 64,
-        Architecture::X86 => 32,
-        _ => return Err(FrontendError::UnsupportedFormat),
-    };
+    // The backend writes ELF64 headers and x86-64 code, so anything else would
+    // be emitted corrupt rather than protected.
+    if !elf.is_64 || elf.header.e_machine != EM_X86_64 {
+        return Err(FrontendError::Unsupported(format!(
+            "{}-bit ELF for machine {}; only 64-bit x86-64 ELF is supported",
+            if elf.is_64 { 64 } else { 32 },
+            goblin::elf::header::machine_to_str(elf.header.e_machine),
+        )));
+    }
+    let arch = Architecture::X86_64;
+    let bitness = 64;
 
     let mut module = Module::new("elf_module".into(), arch, BinaryFormat::Elf);
 
@@ -345,6 +345,53 @@ mod tests {
         match result {
             Err(FrontendError::Parse(_)) => {} // expected
             other => panic!("expected Parse error, got: {other:?}"),
+        }
+    }
+
+    /// A bare little-endian ELF header with no program or section headers.
+    fn elf_header(class: u8, machine: u16) -> Vec<u8> {
+        let is64 = class == 2;
+        let mut h = vec![0u8; if is64 { 64 } else { 52 }];
+        h[..4].copy_from_slice(b"\x7fELF");
+        h[4] = class;
+        h[5] = 1; // little endian
+        h[6] = 1; // EV_CURRENT
+        h[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        h[18..20].copy_from_slice(&machine.to_le_bytes());
+        h[20..24].copy_from_slice(&1u32.to_le_bytes());
+        let (ehsize, phentsize, shentsize, at) = if is64 {
+            (64u16, 56u16, 64u16, 52)
+        } else {
+            (52, 32, 40, 40)
+        };
+        h[at..at + 2].copy_from_slice(&ehsize.to_le_bytes());
+        h[at + 2..at + 4].copy_from_slice(&phentsize.to_le_bytes());
+        h[at + 6..at + 8].copy_from_slice(&shentsize.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn lifts_elf64_x86_64_header() {
+        let module = ElfFrontend::new()
+            .lift(&elf_header(2, EM_X86_64))
+            .expect("x86-64 ELF64 is supported");
+        assert_eq!(module.arch, Architecture::X86_64);
+    }
+
+    #[test]
+    fn rejects_32_bit_and_mismatched_elf() {
+        // The backend writes ELF64 structures and x86-64 code, so anything else
+        // must be refused rather than silently corrupted.
+        use goblin::elf::header::EM_386;
+        for (class, machine) in [(1, EM_386), (2, EM_386), (1, EM_X86_64)] {
+            match ElfFrontend::new().lift(&elf_header(class, machine)) {
+                Err(FrontendError::Unsupported(msg)) => {
+                    assert!(msg.contains("x86-64"), "unhelpful message: {msg}")
+                }
+                other => {
+                    panic!("class {class} machine {machine}: expected rejection, got {other:?}")
+                }
+            }
         }
     }
 

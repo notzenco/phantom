@@ -58,7 +58,9 @@ fn lift_pe(data: &[u8]) -> Result<Module, FrontendError> {
     let pe = PE::parse(data).map_err(|e| FrontendError::Parse(e.to_string()))?;
 
     if !pe.is_64 || pe.header.coff_header.machine != IMAGE_FILE_MACHINE_AMD64 {
-        return Err(FrontendError::UnsupportedFormat);
+        return Err(FrontendError::Unsupported(
+            "only x86-64 (PE32+, AMD64) Windows executables are supported".into(),
+        ));
     }
     if pe.is_lib {
         // A DLL entry point runs on every process/thread attach and detach, so an
