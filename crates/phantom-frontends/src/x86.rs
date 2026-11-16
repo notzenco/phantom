@@ -42,7 +42,7 @@ pub(crate) fn lift_function(
     );
 
     let mut func = Function::new(name.to_string(), func_addr, func_size);
-    let func_end = func_addr + func_size;
+    let func_end = func_addr.saturating_add(func_size);
 
     // First pass: find block boundaries (leaders).
     let leaders = find_leaders(&decoded, func_addr, func_end);
@@ -67,7 +67,7 @@ fn find_leaders(decoded: &[DecodedInsn], func_addr: u64, func_end: u64) -> Vec<u
 
     for (i, insn) in decoded.iter().enumerate() {
         let mnemonic = insn.mnemonic;
-        let next_addr = insn.address + insn.bytes.len() as u64;
+        let next_addr = insn.address.wrapping_add(insn.bytes.len() as u64);
 
         if is_branch_mnemonic(mnemonic) || mnemonic == Mnemonic::Jmp {
             // The fall-through address is a leader (if within function bounds).
@@ -128,7 +128,7 @@ fn build_blocks(
             }
 
             let phir_insn = translate_instruction(di, func, &mut reg_cache, data_sections);
-            block_end_addr = di.address + di.bytes.len() as u64;
+            block_end_addr = di.address.wrapping_add(di.bytes.len() as u64);
             instructions.push(phir_insn);
             insn_idx += 1;
         }
@@ -364,7 +364,7 @@ fn detect_data_refs(
 pub(crate) fn data_ref_at(target: u64, data_sections: &[DataSection]) -> Option<DataRef> {
     let section = data_sections
         .iter()
-        .find(|s| target >= s.vaddr && target < s.vaddr + s.data.len() as u64)?;
+        .find(|s| target >= s.vaddr && target - s.vaddr < s.data.len() as u64)?;
     let slice = &section.data[(target - section.vaddr) as usize..];
     let size = slice
         .iter()

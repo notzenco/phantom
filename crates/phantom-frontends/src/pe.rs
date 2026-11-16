@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
-use goblin::pe::{data_directories::DataDirectoryType, PE};
+use goblin::pe::PE;
 use tracing::{debug, warn};
 
 use phantom_core::{
@@ -49,7 +49,10 @@ impl Frontend for PeFrontend {
             return false;
         }
         let pe_offset = u32::from_le_bytes(data[0x3c..0x40].try_into().unwrap()) as usize;
-        data.get(pe_offset..pe_offset + 4) == Some(b"PE\0\0".as_slice())
+        pe_offset
+            .checked_add(4)
+            .and_then(|end| data.get(pe_offset..end))
+            == Some(b"PE\0\0".as_slice())
     }
 
     fn lift(&self, data: &[u8]) -> Result<Module, FrontendError> {
@@ -183,7 +186,7 @@ fn extract_data_sections(pe: &PE, data: &[u8]) -> Vec<DataSection> {
             // Bytes past the raw data are zero-filled by the loader and not in the file.
             let len = s.virtual_size.min(s.size_of_raw_data) as usize;
             let start = s.pointer_to_raw_data as usize;
-            let bytes = data.get(start..start + len)?;
+            let bytes = data.get(start..start.checked_add(len)?)?;
             Some(DataSection {
                 name: section_name(s),
                 vaddr: pe.image_base + s.virtual_address as u64,
@@ -205,7 +208,10 @@ fn extract_data_sections(pe: &PE, data: &[u8]) -> Vec<DataSection> {
 fn function_ranges(pe: &PE) -> Vec<(u32, u32)> {
     let mut ranges = BTreeMap::new();
     if let Some(exceptions) = &pe.exception_data {
-        for rf in exceptions.functions().flatten() {
+        // `functions()` slices without a bounds check and panics on a corrupt
+        // directory size; `get_function` reports the same case as an error.
+        let entries = (0..exceptions.len()).map_while(|i| exceptions.get_function(i).ok());
+        for rf in entries {
             if rf.end_address > rf.begin_address {
                 ranges.entry(rf.begin_address).or_insert(rf.end_address);
             }
@@ -236,7 +242,7 @@ fn function_names(pe: &PE, data: &[u8]) -> HashMap<u32, String> {
         };
         if let Ok(name) = symbol.name(&strings) {
             names
-                .entry(section.virtual_address + symbol.value)
+                .entry(section.virtual_address.wrapping_add(symbol.value))
                 .or_insert_with(|| name.to_string());
         }
     }
@@ -245,27 +251,48 @@ fn function_names(pe: &PE, data: &[u8]) -> HashMap<u32, String> {
 
 fn slice_for_rva<'a>(pe: &PE, data: &'a [u8], rva: u32, len: u32) -> Option<&'a [u8]> {
     let section = pe.sections.iter().find(|s| {
-        rva >= s.virtual_address && rva + len <= s.virtual_address + s.size_of_raw_data
+        let offset = rva.checked_sub(s.virtual_address);
+        offset
+            .and_then(|o| o.checked_add(len))
+            .is_some_and(|end| end <= s.size_of_raw_data)
     })?;
-    let start = (section.pointer_to_raw_data + (rva - section.virtual_address)) as usize;
-    data.get(start..start + len as usize)
+    let start = (section.pointer_to_raw_data as usize)
+        .checked_add((rva - section.virtual_address) as usize)?;
+    data.get(start..start.checked_add(len as usize)?)
 }
 
 /// Virtual-address ranges the Windows loader reads or rewrites before the entry
-/// point runs: data directories (imports, IAT, TLS, load config, resources, ...)
-/// and every base-relocated slot. Encrypting bytes there would break loading.
+/// point runs: data directories (imports, IAT, TLS, load config, resources, ...),
+/// the import, export and TLS objects they point to, and every base-relocated
+/// slot. Encrypting bytes there would break loading.
 fn loader_owned_ranges(pe: &PE, data: &[u8]) -> Vec<Range<u64>> {
     let base = pe.image_base;
     let mut ranges = Vec::new();
 
     if let Some(optional) = pe.header.optional_header {
-        for (kind, dir) in optional.data_directories.dirs() {
-            // The certificate table entry is a file offset, not an RVA.
-            if matches!(kind, DataDirectoryType::CertificateTable) || dir.size == 0 {
-                continue;
-            }
+        let d = &optional.data_directories;
+        // Named getters rather than `dirs()`, which panics when the reserved
+        // sixteenth entry is present. The certificate table entry is a file
+        // offset, not an RVA, so it is left out.
+        let dirs = [
+            d.get_export_table(),
+            d.get_import_table(),
+            d.get_resource_table(),
+            d.get_exception_table(),
+            d.get_base_relocation_table(),
+            d.get_debug_table(),
+            d.get_architecture(),
+            d.get_global_ptr(),
+            d.get_tls_table(),
+            d.get_load_config_table(),
+            d.get_bound_import_table(),
+            d.get_import_address_table(),
+            d.get_delay_import_descriptor(),
+            d.get_clr_runtime_header(),
+        ];
+        for dir in dirs.into_iter().flatten().filter(|dir| dir.size > 0) {
             let start = base + dir.virtual_address as u64;
-            ranges.push(start..start + dir.size as u64);
+            ranges.push(start..start.saturating_add(dir.size as u64));
         }
     }
 

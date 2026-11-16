@@ -13,6 +13,7 @@ use crate::Backend;
 
 const PE32_PLUS_MAGIC: u16 = 0x20b;
 const SECTION_HEADER_SIZE: usize = 40;
+const OPTIONAL_HEADER_SIZE: usize = 240;
 const CERTIFICATE_DIRECTORY: usize = 4;
 const IMAGE_SCN_CNT_CODE: u32 = 0x0000_0020;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -63,6 +64,9 @@ impl Layout {
         if read_u16(binary, optional)? != PE32_PLUS_MAGIC {
             return Err(BackendError::Emit("only PE32+ images are supported".into()));
         }
+        // Every optional-header field this backend reads or writes, up to the
+        // end of the data directories, must be present.
+        read_u64(binary, optional + OPTIONAL_HEADER_SIZE - 8)?;
         let sections = optional + read_u16(binary, coff + 16)? as usize;
         Ok(Self {
             coff,
@@ -80,11 +84,11 @@ impl Layout {
     }
 
     fn section_alignment(&self, binary: &[u8]) -> Result<u64, BackendError> {
-        Ok(read_u32(binary, self.optional + 32)? as u64)
+        alignment(read_u32(binary, self.optional + 32)?, "SectionAlignment")
     }
 
     fn file_alignment(&self, binary: &[u8]) -> Result<u64, BackendError> {
-        Ok(read_u32(binary, self.optional + 36)? as u64)
+        alignment(read_u32(binary, self.optional + 36)?, "FileAlignment")
     }
 
     fn size_of_headers(&self, binary: &[u8]) -> Result<usize, BackendError> {
@@ -111,7 +115,22 @@ impl Layout {
     }
 }
 
+fn alignment(value: u32, field: &str) -> Result<u64, BackendError> {
+    if value.is_power_of_two() {
+        Ok(value as u64)
+    } else {
+        Err(BackendError::Emit(format!(
+            "{field} {value:#x} is not a power of two"
+        )))
+    }
+}
+
 impl Section {
+    /// End of the section in memory, as an RVA.
+    fn virtual_end(&self) -> u64 {
+        self.virtual_address as u64 + self.virtual_extent() as u64
+    }
+
     fn virtual_extent(&self) -> u32 {
         if self.virtual_size == 0 {
             self.raw_size
@@ -155,11 +174,13 @@ impl Backend for PeBackend {
         // Decryption happens in place at runtime, so sections holding encrypted
         // data must be mapped writable.
         for vaddr in patch_data_sections(module, &mut binary) {
-            let rva = vaddr - image_base;
-            if let Some(s) = sections.iter().find(|s| {
-                rva >= s.virtual_address as u64
-                    && rva < (s.virtual_address + s.virtual_extent()) as u64
-            }) {
+            let Some(rva) = vaddr.checked_sub(image_base) else {
+                continue;
+            };
+            if let Some(s) = sections
+                .iter()
+                .find(|s| rva >= s.virtual_address as u64 && rva < s.virtual_end())
+            {
                 let flags = read_u32(&binary, s.header_offset + 36)?;
                 write_u32(
                     &mut binary,
@@ -173,16 +194,14 @@ impl Backend for PeBackend {
             strip_certificate(&mut binary, &layout)?;
 
             let section_alignment = layout.section_alignment(&binary)?;
-            let image_end = sections
-                .iter()
-                .map(|s| (s.virtual_address + s.virtual_extent()) as u64)
-                .max()
-                .unwrap_or(0);
-            let new_rva = align_up(image_end, section_alignment);
+            let image_end = sections.iter().map(Section::virtual_end).max().unwrap_or(0);
+            let new_rva = align_up(image_end, section_alignment)
+                .and_then(|rva| u32::try_from(rva).ok())
+                .ok_or_else(|| BackendError::Emit("image has no room for a new section".into()))?;
 
             let NewCode { code, placed } =
-                encode_new_functions(module, &new_funcs, image_base + new_rva)?;
-            append_code_section(&mut binary, &layout, new_rva as u32, &code)?;
+                encode_new_functions(module, &new_funcs, image_base + new_rva as u64)?;
+            append_code_section(&mut binary, &layout, new_rva, &code)?;
 
             if let Some(&(_, addr)) = placed
                 .iter()
@@ -210,7 +229,7 @@ fn strip_certificate(binary: &mut Vec<u8>, layout: &Layout) -> Result<(), Backen
         return Ok(());
     }
     warn!("Removing Authenticode signature invalidated by protection");
-    if offset + size == binary.len() {
+    if offset.checked_add(size) == Some(binary.len()) {
         binary.truncate(offset);
     }
     write_u32(binary, dir, 0);
@@ -235,10 +254,10 @@ fn append_code_section(
         .map(|s| s.raw_pointer as usize)
         .min()
         .unwrap_or(usize::MAX);
-    if header_end > layout.size_of_headers(binary)?
-        || header_end > first_raw
-        || binary[header..header_end].iter().any(|&b| b != 0)
-    {
+    let slot_is_free = binary
+        .get(header..header_end)
+        .is_some_and(|slot| slot.iter().all(|&b| b == 0));
+    if header_end > layout.size_of_headers(binary)? || header_end > first_raw || !slot_is_free {
         return Err(BackendError::Emit(
             "No room for another section header in the PE headers".into(),
         ));
@@ -246,8 +265,14 @@ fn append_code_section(
 
     let file_alignment = layout.file_alignment(binary)?;
     let section_alignment = layout.section_alignment(binary)?;
-    let raw_pointer = align_up(binary.len() as u64, file_alignment) as usize;
-    let raw_size = align_up(code.len() as u64, file_alignment) as usize;
+    let too_large = || BackendError::Emit("protected image would exceed PE size limits".into());
+    let to_u32 = |v: Option<u64>| v.and_then(|v| u32::try_from(v).ok()).ok_or_else(too_large);
+    let raw_pointer = to_u32(align_up(binary.len() as u64, file_alignment))? as usize;
+    let raw_size = to_u32(align_up(code.len() as u64, file_alignment))? as usize;
+    let size_of_image = to_u32(align_up(rva as u64 + code.len() as u64, section_alignment))?;
+    let size_of_code = read_u32(binary, layout.optional + 4)?
+        .checked_add(raw_size as u32)
+        .ok_or_else(too_large)?;
     binary.resize(raw_pointer, 0);
     binary.extend_from_slice(code);
     binary.resize(raw_pointer + raw_size, 0);
@@ -264,10 +289,8 @@ fn append_code_section(
     );
 
     write_u16(binary, layout.coff + 2, (count + 1) as u16);
-    let size_of_code = read_u32(binary, layout.optional + 4)?;
-    write_u32(binary, layout.optional + 4, size_of_code + raw_size as u32);
-    let size_of_image = align_up(rva as u64 + code.len() as u64, section_alignment);
-    write_u32(binary, layout.optional + 56, size_of_image as u32);
+    write_u32(binary, layout.optional + 4, size_of_code);
+    write_u32(binary, layout.optional + 56, size_of_image);
 
     debug!(
         rva = %format!("{rva:#x}"),

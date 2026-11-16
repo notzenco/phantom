@@ -41,16 +41,19 @@ pub(crate) fn patch_existing_functions(
         })? as usize;
 
         nop_pad(&mut encoded, original_size);
-        if offset + encoded.len() > binary.len() {
+        let Some(end) = offset
+            .checked_add(encoded.len())
+            .filter(|&end| end <= binary.len())
+        else {
             return Err(BackendError::Emit(format!(
                 "Function {} at offset {:#x} extends beyond binary (size {:#x})",
                 func.name,
                 offset,
                 binary.len()
             )));
-        }
+        };
 
-        binary[offset..offset + encoded.len()].copy_from_slice(&encoded);
+        binary[offset..end].copy_from_slice(&encoded);
         trace!(
             func = %func.name,
             addr = %format!("{:#x}", func.address),
@@ -67,12 +70,15 @@ pub(crate) fn patch_existing_functions(
 pub(crate) fn patch_data_sections(module: &Module, binary: &mut [u8]) -> Vec<u64> {
     let mut modified = Vec::new();
     for ds in &module.data_sections {
-        let offset = ds.file_offset as usize;
-        let end = offset + ds.data.len();
-        if end > binary.len() {
+        let range = usize::try_from(ds.file_offset)
+            .ok()
+            .and_then(|offset| Some(offset..offset.checked_add(ds.data.len())?))
+            .filter(|range| range.end <= binary.len());
+        let Some(range) = range else {
             warn!(section = %ds.name, "Data section extends beyond binary, skipping");
             continue;
-        }
+        };
+        let (offset, end) = (range.start, range.end);
         if binary[offset..end] != ds.data[..] {
             binary[offset..end].copy_from_slice(&ds.data);
             modified.push(ds.vaddr);
@@ -105,7 +111,7 @@ pub(crate) fn encode_new_functions(
     let mut placed = Vec::new();
     for &idx in indices {
         let func = &module.functions[idx];
-        let func_addr = load_addr + code.len() as u64;
+        let func_addr = load_addr.wrapping_add(code.len() as u64);
         let mut encoded = re_encode_function_at(func, bitness, func_addr)?;
         apply_raw_fixups(&mut encoded, func, func_addr)?;
         code.extend_from_slice(&encoded);
@@ -196,7 +202,7 @@ pub(crate) fn apply_raw_fixups(
 ) -> Result<(), BackendError> {
     for fixup in &func.raw_fixups {
         let offset = fixup.offset as usize;
-        let end = offset + 8;
+        let end = offset.saturating_add(8);
         if end > encoded.len() {
             return Err(BackendError::Emit(format!(
                 "Raw fixup for function {} at offset {:#x} exceeds encoded size {:#x}",
@@ -207,7 +213,7 @@ pub(crate) fn apply_raw_fixups(
         }
 
         let value = match fixup.target {
-            RawCodeFixupTarget::FunctionAddress { offset } => function_addr + offset,
+            RawCodeFixupTarget::FunctionAddress { offset } => function_addr.wrapping_add(offset),
         };
 
         encoded[offset..end].copy_from_slice(&value.to_le_bytes());
@@ -265,13 +271,13 @@ pub(crate) fn nop_pad(buf: &mut Vec<u8>, target_len: usize) {
     }
 }
 
-/// Read a little-endian u64 from binary at the given offset.
+/// Read a little-endian u64 at `offset`; callers check the header fits first.
 pub(crate) fn read_u64_le(binary: &[u8], offset: usize) -> u64 {
     let bytes: [u8; 8] = binary[offset..offset + 8].try_into().unwrap();
     u64::from_le_bytes(bytes)
 }
 
-/// Read a little-endian u16 from binary at the given offset.
+/// Read a little-endian u16 at `offset`; callers check the header fits first.
 pub(crate) fn read_u16_le(binary: &[u8], offset: usize) -> u16 {
     let bytes: [u8; 2] = binary[offset..offset + 2].try_into().unwrap();
     u16::from_le_bytes(bytes)
@@ -287,9 +293,11 @@ pub(crate) fn write_u16_le(binary: &mut [u8], offset: usize, value: u16) {
     binary[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Align a value up to the given alignment (must be a power of two).
-pub(crate) fn align_up(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) & !(alignment - 1)
+/// Align a value up to the given alignment, which must be a non-zero power of
+/// two; `None` if the result does not fit.
+pub(crate) fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    debug_assert!(alignment.is_power_of_two());
+    Some(value.checked_add(alignment - 1)? & !(alignment - 1))
 }
 
 /// Determine bitness from the module's architecture.
