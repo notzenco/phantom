@@ -157,7 +157,7 @@ pub fn targets() -> &'static [Target] {
                 }
             }
             if targets.is_empty() {
-                eprintln!("no fixture targets can run on this host; skipping matrix");
+                eprintln!("SKIPPED: no fixture targets can run on this host");
             }
             targets
         })
@@ -189,23 +189,46 @@ fn normalized(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace("\r\n", "\n")
 }
 
-pub fn assert_case_output(case: &DemoCase, output: &Output, context: &str) {
-    assert_eq!(
-        output.status.code(),
-        Some(case.expect_exit),
-        "{context}: unexpected exit status, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+/// Why `output` does not match `case`, if it does not.
+pub fn case_output_mismatch(case: &DemoCase, output: &Output, context: &str) -> Option<String> {
+    let mut problems = Vec::new();
+    if output.status.code() != Some(case.expect_exit) {
+        problems.push(format!(
+            "exit {:?}, expected {}",
+            output.status, case.expect_exit
+        ));
+    }
+    let stdout = normalized(&output.stdout);
+    if stdout != case.expect_stdout {
+        problems.push(format!(
+            "stdout {stdout:?}, expected {:?}",
+            case.expect_stdout
+        ));
+    }
+    let stderr = normalized(&output.stderr);
+    if stderr != case.expect_stderr {
+        problems.push(format!(
+            "stderr {stderr:?}, expected {:?}",
+            case.expect_stderr
+        ));
+    }
+    (!problems.is_empty()).then(|| format!("{context}: {}", problems.join("; ")))
+}
+
+/// Fail with every collected problem at once, or say plainly that nothing ran,
+/// so an empty matrix reads as a skip rather than a pass.
+pub fn report_matrix(name: &str, runs: usize, failures: &[String]) {
+    assert!(
+        failures.is_empty(),
+        "{name} matrix: {} failure(s):\n{}",
+        failures.len(),
+        failures.join("\n")
     );
-    assert_eq!(
-        normalized(&output.stdout),
-        case.expect_stdout,
-        "{context}: unexpected stdout"
-    );
-    assert_eq!(
-        normalized(&output.stderr),
-        case.expect_stderr,
-        "{context}: unexpected stderr"
-    );
+    if runs == 0 {
+        eprintln!("SKIPPED: {name} matrix ran no cases (no fixture targets on this host)");
+    } else {
+        eprintln!("{name} matrix: {runs} case run(s) passed");
+    }
 }
 
 pub fn protect_binary(input: &Path, output: &Path, profile: Option<&str>) -> Output {
