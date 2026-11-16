@@ -89,7 +89,25 @@ phantom-cli protect -i ./my_binary -o ./my_binary_protected --profile research -
 
 # Merge a profile with explicit passes; duplicate pass names are removed
 phantom-cli protect -i ./my_binary -o ./my_binary_protected --profile strings -p string_encryption
+
+# Reproducible output: the same seed gives the same keys
+phantom-cli protect -i ./my_binary -o ./my_binary_protected --profile strings --seed 42
+
+# More log output (-v info, -vv debug); warnings are always shown
+phantom-cli -v protect -i ./my_binary -o ./my_binary_protected --profile strings
 ```
+
+`protect` prints a summary of what it did. For the static `banner_messages` fixture:
+
+```
+Protected ./banner_messages -> ./banner_messages_protected
+  functions lifted: 1286
+  passes: string_encryption
+  data encrypted: 23434 bytes in 2 section(s)
+  size: 762400 -> 887800 bytes (+16.4%)
+```
+
+If the requested passes change nothing, it fails without writing output.
 
 `--profile-file` is only accepted when `--profile` is present. When both `--profile` and `--passes` are provided, Phantom resolves the profile first, appends the explicit passes, then stable-dedupes the final pass list.
 
@@ -101,14 +119,18 @@ phantom-cli info ./my_binary
 
 Output:
 ```
-Binary: ./my_binary
+Binary: ./banner_messages
 Architecture: X86_64
 Format: Elf
-Entry point: 0x402dc0
+Entry point: 0x401520
 PIE: false
-Functions: 1378
+Program headers: 10
+Section headers: 30
+Functions: 1286
 Data sections: 4
 ```
+
+(followed by one line per data section).
 
 ### Dump IR
 
@@ -176,7 +198,6 @@ phantom-cli
 ├── phantom-frontends
 │   ├── phantom-core
 │   └── phantom-disasm
-│       └── phantom-core
 ├── phantom-backends
 │   ├── phantom-core
 │   └── phantom-disasm
@@ -186,15 +207,15 @@ phantom-cli
 
 ## How String Encryption Works
 
-1. **Scan**: Find printable strings referenced by RIP-relative instructions or by pointers stored in data (static ELF words, PIE `R_X86_64_RELATIVE` relocations, PE base-relocated slots). On PE, anything the Windows loader reads before the entry point (data directories, relocated slots) is left alone
+1. **Scan**: Find printable strings referenced by RIP-relative instructions or by pointers stored in data (static ELF words, PIE `R_X86_64_RELATIVE` and packed `DT_RELR` relocations, PE base-relocated slots). Data the loader touches before the entry point is left alone: on ELF, relocated slots and `PT_GNU_RELRO` segments; on PE, the data directories, the import, export and TLS data they point to, and relocated slots. Strings referenced directly by code the loader runs before the entry point (PE TLS callbacks, ELF preinit routines and IFUNC resolvers) are also left alone, with a warning
 2. **Encrypt**: XOR each string in the data section with a random key
 3. **Generate thunks**: Create position-independent x86-64 decryptor functions for each string
 4. **Carry fixups**: Store backend-patchable fixups for injected code so final addresses can be resolved after layout is known
 5. **Init function**: Generate `__phantom_init` that calls all decryptor thunks, then jumps to the original entry point
 6. **Redirect entry**: The backend points the ELF `e_entry` or PE `AddressOfEntryPoint` at `__phantom_init`
-7. **Segment setup**: Segments/sections holding encrypted strings are made writable. ELF gets a new PT_LOAD segment (replacing a PT_NOTE header); PE gets a new `.phantom` section, a recomputed checksum, and loses any Authenticode signature, which protection invalidates
+7. **Segment setup**: Segments/sections holding encrypted strings are made writable. ELF gets a new PT_LOAD segment (its header goes in free space after the program header table, or replaces a PT_NOTE header); PE gets a new `.phantom` section, a recomputed checksum, and loses any Authenticode signature, which protection invalidates
 
-At runtime, init runs first, decrypts all strings in-place, then transfers control to the original program entry. The injected code computes the load bias (runtime address minus link-time address) itself, so the same code works for fixed-address executables, PIE and ASLR-relocated PE images.
+At runtime, init runs at the entry point, decrypts all strings in-place, then transfers control to the original program entry. Code the loader runs earlier (see step 1) sees encrypted strings, which is why the strings it references are skipped. The injected code computes the load bias (runtime address minus link-time address) itself, so the same code works for fixed-address executables, PIE and ASLR-relocated PE images.
 
 ### Why not Mach-O yet
 
@@ -202,13 +223,15 @@ In-place decryption needs the string pages to be writable at runtime. On macOS, 
 
 ## Results
 
-From the fixture matrix (10 C programs, 13 behaviour cases, each built for every target):
+From the fixture matrix (11 C programs, 14 behaviour cases, each built for every target):
 
 | Target | Cases passing after protection | Probe strings hidden | Size overhead (`banner_messages`) |
 |--------|-------------------------------|----------------------|-----------------------------------|
-| Linux ELF, static | 13/13 | All | +16.5% |
-| Linux ELF, PIE | 13/13 | All | +5.4% |
-| Windows PE (Wine and native Windows) | 13/13 | All | +1.4% |
+| Linux ELF, static | 14/14 | All | +16.4% |
+| Linux ELF, PIE | 14/14 | All | +5.4% |
+| Windows PE (Wine) | 14/14 | All | +1.5% |
+
+CI also runs the PE matrix natively on Windows.
 
 Every probe is checked to be present in the unprotected binary first, so "hidden" cannot pass by the compiler having removed the string. Static binaries carry the most overhead because libc's own strings are encrypted too, each with its own ~90-byte decryptor stub.
 
@@ -220,6 +243,8 @@ String encryption raises the cost of casual static analysis: `strings`, grep, an
 - **Keys ship with the binary.** Each string is XORed with a random per-string key stored next to its decryptor, so the original bytes can be recovered statically or by emulating the init routine.
 - **Writable read-only data.** Sections holding encrypted strings (`.rodata`, `.rdata`) stay writable for the life of the process, which weakens the usual hardening of constant data.
 - **Coverage is heuristic.** Only printable ASCII strings reached by a RIP-relative instruction or a pointer stored in data are found. UTF-16 strings (`L"..."`) and strings built at runtime are not, and on PE, functions without unwind info (some MSVC leaf functions) are not lifted.
+- **Stripped ELF binaries are barely covered.** ELF functions come from the `.symtab` symbol table. A stripped binary lifts no code, so only strings reached through pointers in data are encrypted; Phantom warns when the symbol table is missing.
+- **Some strings must stay plaintext.** Strings in `PT_GNU_RELRO` data, in loader-read PE structures, or used directly by pre-entry code (TLS callbacks, preinit routines, IFUNC resolvers) are not encrypted. Strings that pre-entry code reaches only through the functions it calls are not traced, and would be read while still encrypted.
 - **Signatures are lost.** Protected PE files have their Authenticode signature removed and must be re-signed.
 
 Planned mitigations: restore read-only protection after decryption, decrypt on first use instead of at start-up, and replace per-string stubs with one table-driven decryptor to cut the static-binary overhead.
@@ -243,7 +268,7 @@ Unit tests run anywhere. The integration matrix (Python 3.11+) compiles the fixt
 - x86-64 Windows: PE with MinGW `gcc`
 - macOS: no executable targets yet, so the matrix is skipped
 
-Set `PHANTOM_REQUIRE_TARGETS=static,dynamic,pe` to fail instead of skipping a target. CI runs formatting, clippy, and the tests on Linux (with Wine), Windows and macOS.
+Set `PHANTOM_REQUIRE_TARGETS=static,dynamic,pe` to fail instead of skipping a target; when a host has no targets, the matrix tests print `SKIPPED` rather than passing silently. Each matrix test reports every failing demo and case at once, and every fixture run has a two-minute timeout. A robustness test corrupts fixture headers and checks that lifting, protecting and emitting return errors instead of panicking (`PHANTOM_MUTATIONS` sets the number of corrupted inputs per target). CI runs formatting, clippy, and the tests on Linux (with Wine), Windows and macOS.
 
 ```sh
 # Run all tests

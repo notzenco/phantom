@@ -9,8 +9,22 @@ Command-line interface for the Phantom code protector.
 Full pipeline: lift binary, apply transform passes, emit protected binary. Accepts x86-64 Linux ELF (static or PIE) and Windows PE executables; the format is detected from the file.
 
 ```sh
-phantom-cli protect -i <input> -o <output> [--profile <name>] [--profile-file <path>] [-p <pass1,pass2,...>]
+phantom-cli protect -i <input> -o <output> [--profile <name>] [--profile-file <path>] [-p <pass1,pass2,...>] [--seed <n>]
 ```
+
+`--seed` makes the passes' random choices (such as encryption keys) reproducible. On success `protect` prints a summary:
+
+```text
+Protected ./banner_messages -> ./banner_messages_protected
+  functions lifted: 2
+  passes: string_encryption
+  data encrypted: 34 bytes in 1 section(s)
+  size: 15976 -> 16840 bytes (+5.4%)
+```
+
+(Output for the PIE `banner_messages` fixture.)
+
+If the requested passes change nothing (for example, no eligible strings were found), `protect` fails and writes no output.
 
 Examples:
 
@@ -75,8 +89,11 @@ The authoritative end-to-end integration tests for the CLI live in `crates/phant
 
 ## Logging
 
-Set `RUST_LOG` for debug output:
+Warnings, such as strings deliberately left unencrypted, go to stderr by default. `-v` adds progress information, `-vv` debug output and `-vvv` traces; `RUST_LOG` overrides both:
 
 ```sh
-RUST_LOG=debug phantom-cli protect -i input -o output --profile strings
+phantom-cli -vv protect -i input -o output --profile strings
+RUST_LOG=phantom_frontends=debug phantom-cli protect -i input -o output --profile strings
 ```
+
+`phantom-cli --version` prints the version.

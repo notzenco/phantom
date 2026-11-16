@@ -21,7 +21,7 @@ Encoding and patching shared by every format live in `common.rs`; `backend_for(f
 5. **Apply raw fixups** — Patch backend-owned immediates in injected raw-code functions after final addresses are assigned
 6. **Redirect entry point** — If `__phantom_init` exists, set it as the ELF entry point
 
-New PT_LOAD segments are added by overwriting a PT_NOTE program header (not needed for execution), avoiding phdr table relocation.
+The new PT_LOAD header goes in zero-filled space right after the program header table when that space is mapped and clear of every section, segment and the section header table (PT_PHDR is grown to match); otherwise it overwrites a PT_NOTE header, which is not needed for execution. The program header table is never relocated. Header fields read from the input are bounds-checked, so a malformed image produces an error rather than a panic.
 
 Injected code fixups allow the same pass-generated raw machine code to work for both ET_EXEC and ET_DYN/PIE binaries. ET_EXEC can use direct absolute targets where valid, while ET_DYN/PIE computes runtime addresses from load bias plus link-time virtual offsets.
 

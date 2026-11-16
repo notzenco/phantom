@@ -25,6 +25,8 @@ Encrypts all detected string literals in data sections using XOR with random key
 
 The injected code path now supports both ET_EXEC and ET_DYN/PIE outputs. PIE binaries recover runtime addresses from load bias rather than assuming fixed absolute addresses.
 
+The pass refuses to run on a module it has already processed (one that contains `__phantom_init`): each run's initializer only removes its own layer of encryption. Zero-length string references are skipped, and a module with nothing to encrypt is left unchanged.
+
 ### Deterministic output
 
 Pass `with_seed(u64)` for reproducible builds:
@@ -37,8 +39,9 @@ let pass = StringEncryptionPass::with_seed(42);
 ## Pass Registry
 
 ```rust
-use phantom_passes::{get_pass, available_passes};
+use phantom_passes::{available_passes, get_pass, get_seeded_pass};
 
 let pass = get_pass("string_encryption").unwrap();
+let seeded = get_seeded_pass("string_encryption", Some(42)).unwrap();
 let names = available_passes(); // ["string_encryption"]
 ```

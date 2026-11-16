@@ -13,7 +13,7 @@ Module
 ├── BinaryMetadata (entry point, program/section headers, PIE flag)
 ├── DataSection[] (name, vaddr, data bytes, permissions, relocations)
 ├── Function[]
-│   ├── name, address, size, vreg_map, raw_bytes, raw_fixups
+│   ├── name, address, size, entry_block, vreg_map, raw_fixups
 │   └── BasicBlock[]
 │       ├── BlockId, start/end addr, Terminator
 │       └── Instruction[]
