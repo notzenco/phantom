@@ -46,6 +46,7 @@ impl Backend for ElfBackend {
             return Err(BackendError::NoRawBinary);
         }
         let mut binary = module.raw_binary.clone();
+        check_header_bounds(&binary)?;
         debug!(
             functions = module.functions.len(),
             data_sections = module.data_sections.len(),
@@ -82,9 +83,6 @@ impl Backend for ElfBackend {
 
             for i in 0..e_phnum {
                 let phdr_offset = e_phoff + i * PHDR64_SIZE;
-                if phdr_offset + PHDR64_SIZE > binary.len() {
-                    break;
-                }
                 let p_type =
                     u32::from_le_bytes(binary[phdr_offset..phdr_offset + 4].try_into().unwrap());
                 if p_type != PT_LOAD {
@@ -94,7 +92,7 @@ impl Backend for ElfBackend {
                 let p_memsz = read_u64_le(&binary, phdr_offset + 40);
 
                 for &sec_vaddr in &modified_section_vaddrs {
-                    if sec_vaddr >= p_vaddr && sec_vaddr < p_vaddr + p_memsz {
+                    if sec_vaddr >= p_vaddr && sec_vaddr - p_vaddr < p_memsz {
                         // Add PF_W (0x2) to the segment flags.
                         let p_flags_offset = phdr_offset + 4;
                         let flags = u32::from_le_bytes(
@@ -125,11 +123,12 @@ impl Backend for ElfBackend {
                 .program_headers
                 .iter()
                 .filter(|ph| ph.p_type == PT_LOAD)
-                .map(|ph| ph.p_vaddr + ph.p_memsz)
+                .map(|ph| ph.p_vaddr.saturating_add(ph.p_memsz))
                 .max()
                 .unwrap_or(0);
 
-            let load_addr = align_up(highest_end, PAGE_ALIGN);
+            let load_addr = align_up(highest_end, PAGE_ALIGN)
+                .ok_or_else(|| BackendError::Emit("no address space left for new code".into()))?;
 
             let NewCode {
                 code: new_code,
@@ -159,11 +158,29 @@ impl Backend for ElfBackend {
     }
 }
 
+/// The ELF header and program header table must lie inside the file; every
+/// later header read relies on this.
+fn check_header_bounds(binary: &[u8]) -> Result<(), BackendError> {
+    let truncated = || BackendError::Emit("ELF header or program header table is truncated".into());
+    if binary.len() < 64 {
+        return Err(truncated());
+    }
+    let e_phoff = usize::try_from(read_u64_le(binary, 32)).map_err(|_| truncated())?;
+    let e_phnum = read_u16_le(binary, 56) as usize;
+    let end = e_phoff
+        .checked_add(e_phnum * PHDR64_SIZE)
+        .ok_or_else(truncated)?;
+    if end > binary.len() {
+        return Err(truncated());
+    }
+    Ok(())
+}
+
 /// Map a virtual address to a file offset using program headers.
 fn vaddr_to_file_offset(module: &Module, vaddr: u64) -> Option<u64> {
     for ph in &module.metadata.program_headers {
-        if ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr < ph.p_vaddr + ph.p_memsz {
-            return Some(vaddr - ph.p_vaddr + ph.p_offset);
+        if ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr - ph.p_vaddr < ph.p_memsz {
+            return ph.p_offset.checked_add(vaddr - ph.p_vaddr);
         }
     }
     None
@@ -175,7 +192,7 @@ fn section_for_vaddr(module: &Module, vaddr: u64) -> Option<&SectionHeader> {
         .metadata
         .section_headers
         .iter()
-        .find(|sh| vaddr >= sh.sh_addr && vaddr < sh.sh_addr + sh.sh_size)
+        .find(|sh| vaddr >= sh.sh_addr && vaddr - sh.sh_addr < sh.sh_size)
 }
 
 /// Append new code to the binary by creating a new PT_LOAD segment.
@@ -191,7 +208,9 @@ fn append_new_segment(
     metadata: &BinaryMetadata,
 ) -> Result<(), BackendError> {
     // Pad binary to page alignment.
-    let aligned_offset = align_up(binary.len() as u64, PAGE_ALIGN) as usize;
+    let aligned_offset = align_up(binary.len() as u64, PAGE_ALIGN)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or_else(|| BackendError::Emit("binary too large to extend".into()))?;
     binary.resize(aligned_offset, 0x00);
 
     let file_offset = binary.len() as u64;
@@ -548,11 +567,12 @@ mod tests {
 
     #[test]
     fn test_align_up() {
-        assert_eq!(align_up(0, 0x1000), 0);
-        assert_eq!(align_up(1, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1000, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1001, 0x1000), 0x2000);
-        assert_eq!(align_up(0xFFF, 0x1000), 0x1000);
+        assert_eq!(align_up(0, 0x1000), Some(0));
+        assert_eq!(align_up(1, 0x1000), Some(0x1000));
+        assert_eq!(align_up(0x1000, 0x1000), Some(0x1000));
+        assert_eq!(align_up(0x1001, 0x1000), Some(0x2000));
+        assert_eq!(align_up(0xFFF, 0x1000), Some(0x1000));
+        assert_eq!(align_up(u64::MAX, 0x1000), None);
     }
 
     #[test]
@@ -657,6 +677,8 @@ mod tests {
         // The emitter should not touch bytes outside of patched regions.
         let mut m = make_test_module();
         m.raw_binary = vec![0xAA; 0x2000];
+        // An ELF header with an empty program header table.
+        m.raw_binary[..64].fill(0);
 
         let backend = ElfBackend::new();
         let result = backend.emit(&m).unwrap();
@@ -781,6 +803,18 @@ mod tests {
         let size = 2 * PHDR64_SIZE as u64;
         assert_eq!(read_u64_le(&binary, 0x40 + 32), size, "PT_PHDR p_filesz");
         assert_eq!(read_u64_le(&binary, 0x40 + 40), size, "PT_PHDR p_memsz");
+    }
+
+    #[test]
+    fn rejects_program_header_table_past_end_of_file() {
+        let mut m = make_test_module();
+        m.raw_binary = vec![0; 0x100];
+        write_u64_le(&mut m.raw_binary, 32, u64::MAX - 8);
+        write_u16_le(&mut m.raw_binary, 56, 4);
+        assert!(matches!(
+            ElfBackend::new().emit(&m),
+            Err(BackendError::Emit(_))
+        ));
     }
 
     #[test]

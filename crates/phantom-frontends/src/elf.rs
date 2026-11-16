@@ -196,13 +196,12 @@ fn extract_data_sections(elf: &Elf, data: &[u8]) -> Vec<DataSection> {
         let section_data = if name == ".bss" {
             Vec::new()
         } else {
-            let offset = sh.sh_offset as usize;
-            let size = sh.sh_size as usize;
-            if offset + size <= data.len() {
-                data[offset..offset + size].to_vec()
-            } else {
-                Vec::new()
-            }
+            usize::try_from(sh.sh_offset)
+                .ok()
+                .zip(usize::try_from(sh.sh_size).ok())
+                .and_then(|(offset, size)| data.get(offset..offset.checked_add(size)?))
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default()
         };
 
         debug!(
@@ -399,9 +398,8 @@ fn read_u64_at_vaddr(elf: &Elf, data: &[u8], vaddr: u64) -> Option<u64> {
 /// Find the section that contains a given virtual address and return the file offset for that address.
 fn find_file_offset_for_addr(elf: &Elf, addr: u64) -> Option<usize> {
     for sh in &elf.section_headers {
-        if addr >= sh.sh_addr && addr < sh.sh_addr + sh.sh_size {
-            let offset_in_section = (addr - sh.sh_addr) as usize;
-            return Some(sh.sh_offset as usize + offset_in_section);
+        if addr >= sh.sh_addr && addr - sh.sh_addr < sh.sh_size {
+            return usize::try_from(sh.sh_offset.checked_add(addr - sh.sh_addr)?).ok();
         }
     }
     None
@@ -444,15 +442,18 @@ fn lift_functions(
             }
         };
 
-        let end = file_offset + func_size as usize;
-        if end > data.len() {
+        let end = usize::try_from(func_size)
+            .ok()
+            .and_then(|size| file_offset.checked_add(size))
+            .filter(|&end| end <= data.len());
+        let Some(end) = end else {
             debug!(
                 name,
                 addr = func_addr,
                 "skipping function: extends beyond file"
             );
             continue;
-        }
+        };
 
         let code_bytes = &data[file_offset..end];
 

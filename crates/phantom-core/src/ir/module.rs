@@ -127,14 +127,14 @@ impl Module {
     pub fn data_section_for_addr(&self, addr: u64) -> Option<&DataSection> {
         self.data_sections
             .iter()
-            .find(|s| addr >= s.vaddr && addr < s.vaddr + s.data.len() as u64)
+            .find(|s| addr >= s.vaddr && addr - s.vaddr < s.data.len() as u64)
     }
 
     /// Find the data section mutably whose address range contains `addr`.
     pub fn data_section_for_addr_mut(&mut self, addr: u64) -> Option<&mut DataSection> {
         self.data_sections
             .iter_mut()
-            .find(|s| addr >= s.vaddr && addr < s.vaddr + s.data.len() as u64)
+            .find(|s| addr >= s.vaddr && addr - s.vaddr < s.data.len() as u64)
     }
 }
 
