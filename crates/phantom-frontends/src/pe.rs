@@ -12,7 +12,7 @@ use phantom_core::{
 };
 use phantom_disasm::IcedDisassembler;
 
-use crate::x86::{lift_function, string_refs_for_pointers};
+use crate::x86::{lift_function, string_refs_for_pointers, unmark_loader_owned_strings};
 use crate::{Frontend, FrontendError};
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -291,30 +291,6 @@ fn pointer_targets(pe: &PE, data: &[u8]) -> Vec<u64> {
         .collect()
 }
 
-fn unmark_loader_owned_strings(module: &mut Module, ranges: &[Range<u64>]) {
-    let code_refs = module
-        .functions
-        .iter_mut()
-        .flat_map(|f| f.instructions_mut())
-        .flat_map(|insn| insn.data_refs.iter_mut());
-    for dref in code_refs.chain(module.data_refs.iter_mut()) {
-        if !dref.is_string {
-            continue;
-        }
-        let span = dref.vaddr..dref.vaddr + dref.size as u64;
-        if ranges
-            .iter()
-            .any(|r| r.start < span.end && span.start < r.end)
-        {
-            debug!(
-                vaddr = dref.vaddr,
-                "string overlaps loader-owned data; leaving it"
-            );
-            dref.is_string = false;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +311,7 @@ mod tests {
 
     #[test]
     fn strings_overlapping_loader_ranges_are_unmarked() {
+        use crate::x86::unmark_loader_owned_strings;
         use phantom_core::ir::function::Function;
         use phantom_core::ir::instruction::{Instruction, InstructionMeta, Opcode};
         use phantom_core::ir::types::{DataRef, OperandSize};
