@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 use goblin::pe::{data_directories::DataDirectoryType, PE};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use phantom_core::{
     ir::module::{BinaryMetadata, DataSection, Module, SectionHeader, SectionPermissions},
@@ -12,7 +12,10 @@ use phantom_core::{
 };
 use phantom_disasm::IcedDisassembler;
 
-use crate::x86::{lift_function, string_refs_for_pointers, unmark_loader_owned_strings};
+use crate::x86::{
+    lift_function, string_refs_for_pointers, unmark_loader_owned_strings,
+    unmark_strings_used_before_entry,
+};
 use crate::{Frontend, FrontendError};
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -103,8 +106,22 @@ fn lift_pe(data: &[u8]) -> Result<Module, FrontendError> {
 
     module.data_refs = string_refs_for_pointers(pointer_targets(&pe, data), &module.data_sections);
 
-    let loader_ranges = loader_owned_ranges(&pe);
+    let loader_ranges = loader_owned_ranges(&pe, data);
     unmark_loader_owned_strings(&mut module, &loader_ranges);
+
+    // TLS callbacks run before the entry point, on every thread attach.
+    let callbacks = pe
+        .tls_data
+        .as_ref()
+        .map(|tls| tls.callbacks.clone())
+        .unwrap_or_default();
+    let kept = unmark_strings_used_before_entry(&mut module, &callbacks);
+    if kept > 0 {
+        warn!(
+            "{kept} string(s) used by TLS callbacks, which run before the entry point, \
+             are left unencrypted"
+        );
+    }
 
     debug!(
         functions = module.functions.len(),
@@ -237,7 +254,7 @@ fn slice_for_rva<'a>(pe: &PE, data: &'a [u8], rva: u32, len: u32) -> Option<&'a 
 /// Virtual-address ranges the Windows loader reads or rewrites before the entry
 /// point runs: data directories (imports, IAT, TLS, load config, resources, ...)
 /// and every base-relocated slot. Encrypting bytes there would break loading.
-fn loader_owned_ranges(pe: &PE) -> Vec<Range<u64>> {
+fn loader_owned_ranges(pe: &PE, data: &[u8]) -> Vec<Range<u64>> {
     let base = pe.image_base;
     let mut ranges = Vec::new();
 
@@ -251,6 +268,11 @@ fn loader_owned_ranges(pe: &PE) -> Vec<Range<u64>> {
             ranges.push(start..start + dir.size as u64);
         }
     }
+
+    let dirs = LoaderDirectories::of(pe);
+    ranges.extend(directory_targets(&dirs, base, |rva, len| {
+        slice_for_rva(pe, data, rva, len)
+    }));
 
     if let Some(relocations) = &pe.relocation_data {
         for block in relocations.blocks().flatten() {
@@ -267,6 +289,153 @@ fn loader_owned_ranges(pe: &PE) -> Vec<Range<u64>> {
     }
 
     ranges
+}
+
+/// RVAs of the directories whose contents point at further loader-read data.
+struct LoaderDirectories {
+    export: Option<u32>,
+    import: Option<u32>,
+    tls: Option<u32>,
+}
+
+impl LoaderDirectories {
+    fn of(pe: &PE) -> Self {
+        let dirs = pe.header.optional_header.map(|oh| oh.data_directories);
+        let rva = |dir: Option<goblin::pe::data_directories::DataDirectory>| {
+            dir.filter(|d| d.size > 0).map(|d| d.virtual_address)
+        };
+        Self {
+            export: dirs
+                .as_ref()
+                .and_then(|d| rva(d.get_export_table().copied())),
+            import: dirs
+                .as_ref()
+                .and_then(|d| rva(d.get_import_table().copied())),
+            tls: dirs.as_ref().and_then(|d| rva(d.get_tls_table().copied())),
+        }
+    }
+}
+
+/// Objects outside the directory spans that the loader reads through them:
+/// DLL and function names, import lookup and address tables, export tables,
+/// and the TLS template, index and callback array (the template is copied for
+/// the main thread before the entry point runs). `read(rva, len)` returns
+/// image bytes; malformed tables just end the walk.
+fn directory_targets<'a>(
+    dirs: &LoaderDirectories,
+    image_base: u64,
+    read: impl Fn(u32, u32) -> Option<&'a [u8]>,
+) -> Vec<Range<u64>> {
+    const MAX_ENTRIES: u32 = 1 << 16;
+    let u32_at = |rva: u32| read(rva, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u64_at = |rva: u32| read(rva, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    // Length of the NUL-terminated string at `rva`, including the NUL.
+    let cstr_len = |rva: u32| {
+        (0..512u32).find_map(|i| match read(rva.checked_add(i)?, 1)? {
+            [0] => Some(i + 1),
+            _ => None,
+        })
+    };
+    let to_rva = |va: u64| u32::try_from(va.checked_sub(image_base)?).ok();
+    let mut ranges: Vec<Range<u32>> = Vec::new();
+    let mut push = |start: u32, len: u32| {
+        if let Some(end) = start.checked_add(len) {
+            ranges.push(start..end);
+        }
+    };
+
+    if let Some(dir) = dirs.import {
+        for desc in (0..MAX_ENTRIES).map_while(|i| dir.checked_add(i.checked_mul(20)?)) {
+            let (Some(lookup), Some(name), Some(iat)) =
+                (u32_at(desc), u32_at(desc + 12), u32_at(desc + 16))
+            else {
+                break;
+            };
+            if lookup == 0 && name == 0 && iat == 0 {
+                break;
+            }
+            if let Some(len) = cstr_len(name) {
+                push(name, len);
+            }
+            let table = if lookup != 0 { lookup } else { iat };
+            let mut count = 0;
+            while let Some(entry) = table.checked_add(count * 8).and_then(u64_at) {
+                count += 1;
+                if entry == 0 || count >= MAX_ENTRIES {
+                    break;
+                }
+                if entry & 1 << 63 == 0 {
+                    let hint_name = entry as u32 & 0x7fff_ffff;
+                    if let Some(len) = hint_name.checked_add(2).and_then(cstr_len) {
+                        push(hint_name, len + 2);
+                    }
+                }
+            }
+            push(lookup, count * 8);
+            push(iat, count * 8);
+        }
+    }
+
+    if let Some(dir) = dirs.export {
+        let field = |off| dir.checked_add(off).and_then(u32_at);
+        if let (
+            Some(name),
+            Some(functions),
+            Some(names),
+            Some(f_table),
+            Some(n_table),
+            Some(o_table),
+        ) = (
+            field(12),
+            field(20),
+            field(24),
+            field(28),
+            field(32),
+            field(36),
+        ) {
+            let (functions, names) = (functions.min(MAX_ENTRIES), names.min(MAX_ENTRIES));
+            if let Some(len) = cstr_len(name) {
+                push(name, len);
+            }
+            push(f_table, functions * 4);
+            push(n_table, names * 4);
+            push(o_table, names * 2);
+            for i in 0..names {
+                if let Some(name) = n_table.checked_add(i * 4).and_then(u32_at) {
+                    if let Some(len) = cstr_len(name) {
+                        push(name, len);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(dir) = dirs.tls {
+        let va_field = |off| dir.checked_add(off).and_then(u64_at).and_then(to_rva);
+        if let (Some(start), Some(end)) = (va_field(0), va_field(8)) {
+            push(start, end.saturating_sub(start));
+        }
+        if let Some(index) = va_field(16) {
+            push(index, 4);
+        }
+        if let Some(callbacks) = va_field(24) {
+            let count = (0..MAX_ENTRIES)
+                .take_while(|i| {
+                    callbacks
+                        .checked_add(i * 8)
+                        .and_then(u64_at)
+                        .is_some_and(|cb| cb != 0)
+                })
+                .count() as u32;
+            push(callbacks, (count + 1) * 8);
+        }
+    }
+
+    ranges
+        .into_iter()
+        .filter(|r| r.start != 0 && !r.is_empty())
+        .map(|r| image_base + r.start as u64..image_base + r.end as u64)
+        .collect()
 }
 
 /// Addresses held in 64-bit base-relocated slots: every absolute pointer in an
@@ -307,6 +476,75 @@ mod tests {
         assert!(!PeFrontend::new().can_handle(&image));
         assert!(!PeFrontend::new().can_handle(b"MZ"));
         assert!(!PeFrontend::new().can_handle(&[0x7f, b'E', b'L', b'F']));
+    }
+
+    #[test]
+    fn directory_targets_are_loader_owned() {
+        const BASE: u64 = 0x1_4000_0000;
+        let mut image = vec![0u8; 0x1000];
+        let put = |image: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            image[at..at + bytes.len()].copy_from_slice(bytes)
+        };
+        let u32le = |v: u32| v.to_le_bytes();
+        let u64le = |v: u64| v.to_le_bytes();
+
+        // Import descriptor -> DLL name, lookup table, address table, hint/name.
+        put(&mut image, 0x100, &u32le(0x300)); // OriginalFirstThunk
+        put(&mut image, 0x10c, &u32le(0x200)); // Name
+        put(&mut image, 0x110, &u32le(0x380)); // FirstThunk
+        put(&mut image, 0x200, b"KERNEL32.dll\0");
+        for table in [0x300, 0x380] {
+            put(&mut image, table, &u64le(0x400));
+            put(&mut image, table + 8, &u64le(1 << 63 | 7)); // by ordinal
+        }
+        put(&mut image, 0x402, b"ExitProcess\0");
+
+        // TLS directory (virtual addresses) -> template, index, callbacks.
+        put(&mut image, 0x500, &u64le(BASE + 0x600));
+        put(&mut image, 0x508, &u64le(BASE + 0x610));
+        put(&mut image, 0x510, &u64le(BASE + 0x620));
+        put(&mut image, 0x518, &u64le(BASE + 0x630));
+        put(&mut image, 0x630, &u64le(BASE + 0x900));
+
+        // Export directory -> DLL name, address/name/ordinal tables, names.
+        put(&mut image, 0x70c, &u32le(0x780));
+        put(&mut image, 0x714, &u32le(1));
+        put(&mut image, 0x718, &u32le(1));
+        put(&mut image, 0x71c, &u32le(0x7a0));
+        put(&mut image, 0x720, &u32le(0x7b0));
+        put(&mut image, 0x724, &u32le(0x7b8));
+        put(&mut image, 0x780, b"a.exe\0");
+        put(&mut image, 0x7b0, &u32le(0x7c0));
+        put(&mut image, 0x7c0, b"run\0");
+
+        let read = |rva: u32, len: u32| image.get(rva as usize..(rva + len) as usize);
+        let dirs = LoaderDirectories {
+            export: Some(0x700),
+            import: Some(0x100),
+            tls: Some(0x500),
+        };
+        let ranges = directory_targets(&dirs, BASE, read);
+
+        for expected in [
+            0x200..0x20d, // DLL name
+            0x300..0x318, // lookup table incl. terminator
+            0x380..0x398, // address table incl. terminator
+            0x400..0x40e, // hint + "ExitProcess\0"
+            0x600..0x610, // TLS template
+            0x620..0x624, // TLS index
+            0x630..0x640, // callback array incl. terminator
+            0x7a0..0x7a4, // export address table
+            0x7b0..0x7b4, // export name pointers
+            0x7b8..0x7ba, // export ordinals
+            0x780..0x786, // export DLL name
+            0x7c0..0x7c4, // export name
+        ] {
+            let expected = BASE + expected.start..BASE + expected.end;
+            assert!(
+                ranges.contains(&expected),
+                "missing {expected:x?} in {ranges:x?}"
+            );
+        }
     }
 
     #[test]
