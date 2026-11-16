@@ -1,15 +1,16 @@
 //! Architecture-level x86/x86-64 lifting shared by every binary-format frontend.
 
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 
 use iced_x86::{Mnemonic, OpKind, Register};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use phantom_core::ir::{
     block::{BasicBlock, BlockId, CallTarget, Terminator},
     function::Function,
     instruction::{Instruction, InstructionMeta, Opcode},
-    module::DataSection,
+    module::{DataSection, Module},
     types::{DataRef, ImmValue, MemOperand, Operand, OperandSize, PhysReg, VReg},
 };
 use phantom_disasm::iced::DecodedInsn;
@@ -390,6 +391,33 @@ pub(crate) fn string_refs_for_pointers(
         .filter_map(|t| data_ref_at(t, data_sections))
         .filter(|d| d.is_string)
         .collect()
+}
+
+/// Drop the string flag from every reference overlapping `ranges`: bytes the
+/// loader reads, rewrites or write-protects before the entry point cannot be
+/// encrypted and decrypted in place.
+pub(crate) fn unmark_loader_owned_strings(module: &mut Module, ranges: &[Range<u64>]) {
+    let code_refs = module
+        .functions
+        .iter_mut()
+        .flat_map(|f| f.instructions_mut())
+        .flat_map(|insn| insn.data_refs.iter_mut());
+    for dref in code_refs.chain(module.data_refs.iter_mut()) {
+        if !dref.is_string {
+            continue;
+        }
+        let span = dref.vaddr..dref.vaddr + dref.size as u64;
+        if ranges
+            .iter()
+            .any(|r| r.start < span.end && span.start < r.end)
+        {
+            debug!(
+                vaddr = dref.vaddr,
+                "string overlaps loader-owned data; leaving it"
+            );
+            dref.is_string = false;
+        }
+    }
 }
 
 /// Check if a byte slice looks like a printable ASCII string (optionally null-terminated).

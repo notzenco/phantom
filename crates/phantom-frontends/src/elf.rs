@@ -1,6 +1,10 @@
+use std::ops::Range;
+
 use goblin::elf::{
     header::{EM_X86_64, ET_DYN},
+    program_header::{PT_GNU_RELRO, PT_LOAD},
     reloc::R_X86_64_RELATIVE,
+    section_header::SHF_ALLOC,
     sym::STT_FUNC,
     Elf,
 };
@@ -17,7 +21,7 @@ use phantom_core::{
 };
 use phantom_disasm::IcedDisassembler;
 
-use crate::x86::{lift_function, string_refs_for_pointers};
+use crate::x86::{lift_function, string_refs_for_pointers, unmark_loader_owned_strings};
 use crate::{Frontend, FrontendError};
 
 /// ELF binary lifter — parses ELF files and lifts them to PhIR.
@@ -68,8 +72,9 @@ fn lift_elf(data: &[u8]) -> Result<Module, FrontendError> {
 
     // Extract data sections.
     module.data_sections = extract_data_sections(&elf, data);
+    let relr = relr_slots(&elf, data);
     module.data_refs = string_refs_for_pointers(
-        pointer_targets(&elf, &module.data_sections),
+        pointer_targets(&elf, data, &relr, &module.data_sections),
         &module.data_sections,
     );
 
@@ -79,6 +84,11 @@ fn lift_elf(data: &[u8]) -> Result<Module, FrontendError> {
     // Lift functions from symbol table.
     let functions = lift_functions(&elf, data, bitness, &module.data_sections)?;
     module.functions = functions;
+
+    let mut slots = relocated_slots(&elf);
+    slots.extend_from_slice(&relr);
+    let loader_ranges = loader_owned_ranges(&slots, &module.metadata.program_headers);
+    unmark_loader_owned_strings(&mut module, &loader_ranges);
 
     debug!(
         functions = module.functions.len(),
@@ -199,16 +209,26 @@ fn extract_data_sections(elf: &Elf, data: &[u8]) -> Vec<DataSection> {
 }
 
 /// Addresses stored as pointers in data. A PIE stores zeros in the file and lets
-/// `R_X86_64_RELATIVE` relocations supply the address; a fixed-address executable
-/// stores absolute addresses directly, so aligned words are read as candidates.
-fn pointer_targets(elf: &Elf, data_sections: &[DataSection]) -> Vec<u64> {
+/// `R_X86_64_RELATIVE` relocations supply the address, unless the relocations are
+/// packed (`DT_RELR`), in which case the file holds the link-time address; a
+/// fixed-address executable stores absolute addresses directly, so aligned words
+/// are read as candidates.
+fn pointer_targets(
+    elf: &Elf,
+    data: &[u8],
+    relr: &[u64],
+    data_sections: &[DataSection],
+) -> Vec<u64> {
     if elf.header.e_type == ET_DYN {
-        return elf
+        let relocated = elf
             .dynrelas
             .iter()
             .filter(|r| r.r_type == R_X86_64_RELATIVE)
-            .filter_map(|r| r.r_addend.map(|a| a as u64))
-            .collect();
+            .filter_map(|r| r.r_addend.map(|a| a as u64));
+        let packed = relr
+            .iter()
+            .filter_map(|&slot| read_u64_at_vaddr(elf, data, slot));
+        return relocated.chain(packed).collect();
     }
     data_sections
         .iter()
@@ -223,6 +243,107 @@ fn pointer_targets(elf: &Elf, data_sections: &[DataSection]) -> Vec<u64> {
                 .map(|w| u64::from_le_bytes(*w))
         })
         .collect()
+}
+
+const DT_RELRSZ: u64 = 35;
+const DT_RELR: u64 = 36;
+
+/// Addresses the loader or start-up code rewrites through a relocation: every
+/// dynamic relocation plus allocated relocation sections such as a static
+/// binary's `.rela.iplt`. Packed `DT_RELR` slots come from [`relr_slots`].
+fn relocated_slots(elf: &Elf) -> Vec<u64> {
+    let mut slots: Vec<u64> = elf
+        .dynrelas
+        .iter()
+        .chain(elf.dynrels.iter())
+        .chain(elf.pltrelocs.iter())
+        .map(|r| r.r_offset)
+        .collect();
+    for (idx, relocs) in &elf.shdr_relocs {
+        let allocated = elf
+            .section_headers
+            .get(*idx)
+            .is_some_and(|sh| sh.sh_flags & SHF_ALLOC as u64 != 0);
+        if allocated {
+            slots.extend(relocs.iter().map(|r| r.r_offset));
+        }
+    }
+    slots
+}
+
+/// Slots relocated through the packed `DT_RELR` table, which goblin does not parse.
+fn relr_slots(elf: &Elf, data: &[u8]) -> Vec<u64> {
+    let Some(dynamic) = &elf.dynamic else {
+        return Vec::new();
+    };
+    let tag = |t| dynamic.dyns.iter().find(|d| d.d_tag == t).map(|d| d.d_val);
+    let (Some(addr), Some(size)) = (tag(DT_RELR), tag(DT_RELRSZ)) else {
+        return Vec::new();
+    };
+    let table = vaddr_to_offset(elf, addr)
+        .zip(usize::try_from(size).ok())
+        .and_then(|(start, len)| data.get(start..start.checked_add(len)?));
+    let Some(table) = table else {
+        return Vec::new();
+    };
+    decode_relr(
+        table
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| u64::from_le_bytes(*w)),
+    )
+}
+
+/// Expand `DT_RELR` entries: an even entry is an address to relocate, an odd one
+/// a bitmap whose bits 1..=63 relocate the following words.
+fn decode_relr(entries: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut slots = Vec::new();
+    let mut next = 0u64;
+    for entry in entries {
+        if entry & 1 == 0 {
+            slots.push(entry);
+            next = entry.wrapping_add(8);
+        } else {
+            slots.extend(
+                (1..64u64)
+                    .filter(|bit| entry >> bit & 1 == 1)
+                    .map(|bit| next.wrapping_add((bit - 1) * 8)),
+            );
+            next = next.wrapping_add(63 * 8);
+        }
+    }
+    slots
+}
+
+/// Ranges the loader writes or write-protects before the entry point: each
+/// relocated 8-byte slot and every `PT_GNU_RELRO` segment, which is read-only by
+/// the time the decryptor runs.
+fn loader_owned_ranges(slots: &[u64], program_headers: &[ProgramHeader]) -> Vec<Range<u64>> {
+    slots
+        .iter()
+        .map(|&slot| slot..slot.saturating_add(8))
+        .chain(
+            program_headers
+                .iter()
+                .filter(|ph| ph.p_type == PT_GNU_RELRO)
+                .map(|ph| ph.p_vaddr..ph.p_vaddr.saturating_add(ph.p_memsz)),
+        )
+        .collect()
+}
+
+/// File offset backing `vaddr`, from the loadable segments.
+fn vaddr_to_offset(elf: &Elf, vaddr: u64) -> Option<usize> {
+    let ph = elf.program_headers.iter().find(|ph| {
+        ph.p_type == PT_LOAD && vaddr >= ph.p_vaddr && vaddr - ph.p_vaddr < ph.p_filesz
+    })?;
+    usize::try_from(ph.p_offset.checked_add(vaddr - ph.p_vaddr)?).ok()
+}
+
+fn read_u64_at_vaddr(elf: &Elf, data: &[u8], vaddr: u64) -> Option<u64> {
+    let start = vaddr_to_offset(elf, vaddr)?;
+    let bytes = data.get(start..start.checked_add(8)?)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// Find the section that contains a given virtual address and return the file offset for that address.
@@ -393,6 +514,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn decodes_packed_relative_relocations() {
+        // An address entry, then a bitmap covering the next 63 words: bits 1 and 3
+        // relocate the first and third words after the address entry's word.
+        let slots = decode_relr([0x1000, (1 << 1 | 1 << 3) | 1, 0x3000]);
+        assert_eq!(slots, vec![0x1000, 0x1008, 0x1018, 0x3000]);
+        // Successive bitmaps continue 63 words further on.
+        let slots = decode_relr([0x1000, 1, 0b11]);
+        assert_eq!(slots, vec![0x1000, 0x1000 + 8 + 63 * 8]);
+    }
+
+    #[test]
+    fn loader_ranges_cover_relocated_slots_and_relro() {
+        let relro = ProgramHeader {
+            p_type: PT_GNU_RELRO,
+            p_flags: 4,
+            p_offset: 0x2000,
+            p_vaddr: 0x3000,
+            p_paddr: 0x3000,
+            p_filesz: 0x100,
+            p_memsz: 0x100,
+            p_align: 1,
+        };
+        let ranges = loader_owned_ranges(&[0x5000], std::slice::from_ref(&relro));
+        assert!(ranges.contains(&(0x5000..0x5008)));
+        assert!(ranges.contains(&(0x3000..0x3100)));
     }
 
     #[test]

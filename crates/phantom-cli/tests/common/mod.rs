@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -231,4 +233,51 @@ pub fn probe_hits(bytes: &[u8], probes: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+/// How long one fixture run may take before it counts as hung. Wine start-up on
+/// a cold prefix is the slowest case.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run `command` to completion, killing it if it outlives [`RUN_TIMEOUT`] so a
+/// protected binary that hangs fails its test instead of stalling the job.
+pub fn run_with_timeout(command: &mut Command) -> Output {
+    try_run_with_timeout(command).unwrap_or_else(|err| panic!("{err}"))
+}
+
+pub fn try_run_with_timeout(command: &mut Command) -> Result<Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn {command:?}: {err}"))?;
+    // Drain both pipes concurrently so a chatty child cannot block on a full pipe.
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("piped stdout")));
+    let stderr = drain(Box::new(child.stderr.take().expect("piped stderr")));
+
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|err| format!("wait: {err}"))? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{command:?} timed out after {RUN_TIMEOUT:?}"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().expect("stdout reader"),
+        stderr: stderr.join().expect("stderr reader"),
+    })
 }
