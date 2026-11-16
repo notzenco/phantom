@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use tracing::debug;
 
 use phantom_core::ir::module::{BinaryMetadata, Module, SectionHeader};
@@ -220,10 +222,11 @@ fn append_new_segment(
     let phdr_table_end = e_phoff + e_phnum * PHDR64_SIZE;
 
     // Strategy 1: Space after existing phdrs.
-    let first_content_offset = find_first_content_after(binary, phdr_table_end, metadata);
-    if phdr_table_end + PHDR64_SIZE <= first_content_offset {
-        binary[phdr_table_end..phdr_table_end + PHDR64_SIZE].copy_from_slice(&phdr);
+    let slot = phdr_table_end..phdr_table_end + PHDR64_SIZE;
+    if phdr_slot_is_free(binary, metadata, &slot) {
+        binary[slot].copy_from_slice(&phdr);
         write_u16_le(binary, 56, (e_phnum + 1) as u16);
+        extend_pt_phdr(binary, e_phoff, e_phnum + 1);
         debug!("Added new PT_LOAD program header in-place");
         return Ok(());
     }
@@ -270,23 +273,55 @@ fn build_phdr(
     buf
 }
 
-/// Find the offset of the first content after `after_offset`.
-/// This is used to determine if there's room to insert a program header in-place.
-fn find_first_content_after(
-    _binary: &[u8],
-    after_offset: usize,
-    metadata: &BinaryMetadata,
-) -> usize {
-    let mut earliest = usize::MAX;
+/// Whether `slot` (file offsets) can take another program header: it must be
+/// zero-filled, mapped by a loadable segment so the loader sees the grown table,
+/// and clear of every section, non-loadable segment and the section header table.
+fn phdr_slot_is_free(binary: &[u8], metadata: &BinaryMetadata, slot: &Range<usize>) -> bool {
+    const SHT_NULL: u32 = 0;
+    const SHT_NOBITS: u32 = 8;
+    const PT_PHDR: u32 = 6;
 
-    for sh in &metadata.section_headers {
-        let off = sh.sh_offset as usize;
-        if off > after_offset && off < earliest {
-            earliest = off;
+    let Some(bytes) = binary.get(slot.clone()) else {
+        return false;
+    };
+    if bytes.iter().any(|&b| b != 0) {
+        return false;
+    }
+    let (start, end) = (slot.start as u64, slot.end as u64);
+    let overlaps = |offset: u64, size: u64| offset < end && start < offset.saturating_add(size);
+
+    let mapped = metadata.program_headers.iter().any(|ph| {
+        ph.p_type == PT_LOAD
+            && ph.p_offset <= start
+            && end <= ph.p_offset.saturating_add(ph.p_filesz)
+    });
+    let section_in_the_way = metadata.section_headers.iter().any(|sh| {
+        sh.sh_type != SHT_NULL && sh.sh_type != SHT_NOBITS && overlaps(sh.sh_offset, sh.sh_size)
+    });
+    let segment_in_the_way = metadata
+        .program_headers
+        .iter()
+        .filter(|ph| ph.p_type != PT_LOAD && ph.p_type != PT_PHDR)
+        .any(|ph| overlaps(ph.p_offset, ph.p_filesz));
+    let e_shoff = read_u64_le(binary, 40);
+    let shdr_table = u64::from(read_u16_le(binary, 58)) * u64::from(read_u16_le(binary, 60));
+    let shdrs_in_the_way = shdr_table > 0 && overlaps(e_shoff, shdr_table);
+
+    mapped && !section_in_the_way && !segment_in_the_way && !shdrs_in_the_way
+}
+
+/// Grow a PT_PHDR entry to cover all `phnum` program headers, as the loader
+/// trusts it to describe the table.
+fn extend_pt_phdr(binary: &mut [u8], e_phoff: usize, phnum: usize) {
+    const PT_PHDR: u32 = 6;
+    let size = (phnum * PHDR64_SIZE) as u64;
+    for i in 0..phnum {
+        let off = e_phoff + i * PHDR64_SIZE;
+        if u32::from_le_bytes(binary[off..off + 4].try_into().unwrap()) == PT_PHDR {
+            write_u64_le(binary, off + 32, size);
+            write_u64_le(binary, off + 40, size);
         }
     }
-
-    earliest
 }
 
 #[cfg(test)]
@@ -628,6 +663,124 @@ mod tests {
 
         // No functions or data sections to patch, so binary should be unchanged.
         assert_eq!(result, m.raw_binary);
+    }
+
+    const PT_NOTE: u32 = 4;
+    const PT_PHDR: u32 = 6;
+    const PT_INTERP: u32 = 3;
+
+    fn phdr(p_type: u32, offset: u64, size: u64) -> ProgramHeader {
+        ProgramHeader {
+            p_type,
+            p_flags: 4,
+            p_offset: offset,
+            p_vaddr: 0x400000 + offset,
+            p_paddr: 0x400000 + offset,
+            p_filesz: size,
+            p_memsz: size,
+            p_align: 8,
+        }
+    }
+
+    /// A 0x2000-byte ELF64 image whose program header table at 0x40 holds
+    /// `phdrs`; the first page is mapped by a PT_LOAD the table does not list.
+    fn image_with_phdrs(phdrs: &[ProgramHeader]) -> (Vec<u8>, BinaryMetadata) {
+        let mut binary = vec![0u8; 0x2000];
+        binary[..4].copy_from_slice(b"\x7fELF");
+        write_u64_le(&mut binary, 32, 0x40);
+        write_u16_le(&mut binary, 56, phdrs.len() as u16);
+        for (i, ph) in phdrs.iter().enumerate() {
+            let raw = build_phdr(
+                ph.p_type,
+                ph.p_flags,
+                ph.p_offset,
+                ph.p_vaddr,
+                ph.p_paddr,
+                ph.p_filesz,
+                ph.p_memsz,
+                ph.p_align,
+            );
+            binary[0x40 + i * PHDR64_SIZE..0x40 + (i + 1) * PHDR64_SIZE].copy_from_slice(&raw);
+        }
+        let mut program_headers = phdrs.to_vec();
+        program_headers.push(phdr(PT_LOAD, 0, 0x1000));
+        let metadata = BinaryMetadata {
+            entry_point: 0,
+            program_headers,
+            section_headers: Vec::new(),
+            is_pie: false,
+        };
+        (binary, metadata)
+    }
+
+    fn section(name: &str, offset: u64, size: u64) -> SectionHeader {
+        SectionHeader {
+            name: name.into(),
+            sh_type: 1,
+            sh_flags: 2,
+            sh_addr: 0x400000 + offset,
+            sh_offset: offset,
+            sh_size: size,
+            sh_link: 0,
+            sh_info: 0,
+            sh_addralign: 1,
+            sh_entsize: 0,
+        }
+    }
+
+    fn phdr_type(binary: &[u8], index: usize) -> u32 {
+        let off = 0x40 + index * PHDR64_SIZE;
+        u32::from_le_bytes(binary[off..off + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn new_phdr_does_not_overwrite_section_starting_at_table_end() {
+        // Table: PT_NOTE at 0x40..0x78. `.interp` starts exactly at 0x78.
+        let (mut binary, mut metadata) = image_with_phdrs(&[phdr(PT_NOTE, 0x200, 0x20)]);
+        metadata
+            .section_headers
+            .push(section(".interp", 0x78, 0x1c));
+        binary[0x78..0x94].copy_from_slice(b"/lib64/ld-linux-x86-64.so.2\0");
+        let interp = binary[0x78..0x94].to_vec();
+
+        append_new_segment(&mut binary, &[0xC3], 0x800000, &metadata).unwrap();
+
+        assert_eq!(&binary[0x78..0x94], &interp[..], ".interp was overwritten");
+        assert_eq!(
+            read_u16_le(&binary, 56),
+            1,
+            "table must not grow into .interp"
+        );
+        assert_eq!(phdr_type(&binary, 0), PT_LOAD, "PT_NOTE should be reused");
+    }
+
+    #[test]
+    fn new_phdr_does_not_overwrite_section_spanning_table_end() {
+        let (mut binary, mut metadata) = image_with_phdrs(&[phdr(PT_NOTE, 0x200, 0x20)]);
+        metadata.section_headers.push(section(".note", 0x70, 0x40));
+        append_new_segment(&mut binary, &[0xC3], 0x800000, &metadata).unwrap();
+        assert_eq!(read_u16_le(&binary, 56), 1);
+    }
+
+    #[test]
+    fn new_phdr_does_not_overwrite_segment_only_content() {
+        // No section headers (stripped), but PT_INTERP still occupies 0xb0.
+        let (mut binary, metadata) =
+            image_with_phdrs(&[phdr(PT_NOTE, 0x200, 0x20), phdr(PT_INTERP, 0xb0, 0x1c)]);
+        append_new_segment(&mut binary, &[0xC3], 0x800000, &metadata).unwrap();
+        assert_eq!(read_u16_le(&binary, 56), 2);
+        assert_eq!(phdr_type(&binary, 0), PT_LOAD);
+    }
+
+    #[test]
+    fn new_phdr_in_gap_extends_pt_phdr() {
+        let (mut binary, metadata) = image_with_phdrs(&[phdr(PT_PHDR, 0x40, PHDR64_SIZE as u64)]);
+        append_new_segment(&mut binary, &[0xC3], 0x800000, &metadata).unwrap();
+        assert_eq!(read_u16_le(&binary, 56), 2);
+        assert_eq!(phdr_type(&binary, 1), PT_LOAD);
+        let size = 2 * PHDR64_SIZE as u64;
+        assert_eq!(read_u64_le(&binary, 0x40 + 32), size, "PT_PHDR p_filesz");
+        assert_eq!(read_u64_le(&binary, 0x40 + 40), size, "PT_PHDR p_memsz");
     }
 
     #[test]
