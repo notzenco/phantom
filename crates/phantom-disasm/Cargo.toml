@@ -6,7 +6,6 @@ license.workspace = true
 description = "Disassembly engine wrapping iced-x86 for Phantom"
 
 [dependencies]
-phantom-core.workspace = true
 iced-x86.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

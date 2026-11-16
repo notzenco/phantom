@@ -17,8 +17,6 @@ pub enum BackendError {
         original: usize,
         new: usize,
     },
-    #[error("Section not found: {0}")]
-    SectionNotFound(String),
     #[error("Disassembly error: {0}")]
     Disasm(#[from] phantom_disasm::DisasmError),
 }

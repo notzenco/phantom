@@ -7,7 +7,6 @@ description = "CLI interface for Phantom code protector"
 
 [dependencies]
 phantom-core.workspace = true
-phantom-disasm.workspace = true
 phantom-frontends.workspace = true
 phantom-backends.workspace = true
 phantom-passes.workspace = true
