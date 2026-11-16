@@ -138,3 +138,15 @@ args = ["--fail"]
 expect_stdout = ""
 expect_stderr = "status:fail code=17\n"
 expect_exit = 17
+
+[[demo]]
+name = "early_init"
+source = "src/early_init.c"
+string_probes = ["late:%s", "after-entry"]
+
+[[demo.case]]
+name = "default"
+args = []
+expect_stdout = "early:before-entry\nlate:after-entry\n"
+expect_stderr = ""
+expect_exit = 0
