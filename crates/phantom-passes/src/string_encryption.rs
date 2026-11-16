@@ -15,6 +15,9 @@ use phantom_core::ir::types::OperandSize;
 use phantom_core::pass::{Pass, PassInfo};
 use phantom_core::PhantomError;
 
+/// Name of the injected start-up routine; backends redirect the entry point to it.
+const INIT_FUNCTION: &str = "__phantom_init";
+
 /// Information about a string reference found in the IR.
 #[derive(Debug, Clone)]
 struct StringRef {
@@ -81,6 +84,14 @@ impl Pass for StringEncryptionPass {
     }
 
     fn run(&self, module: &mut Module) -> Result<(), PhantomError> {
+        // Each run's initializer only removes its own layer, so a second run on
+        // the same module would leave every string encrypted at run time.
+        if module.function(INIT_FUNCTION).is_some() {
+            return Err(PhantomError::Pass(format!(
+                "string encryption has already been applied to this module ({INIT_FUNCTION} exists)"
+            )));
+        }
+
         // Step 1: Collect all string references from instructions.
         let string_refs = collect_string_refs(module);
         if string_refs.is_empty() {
@@ -98,6 +109,10 @@ impl Pass for StringEncryptionPass {
 
         // Step 2: Encrypt strings in data sections and generate thunk metadata.
         let encrypted = encrypt_strings(module, &unique_vaddrs, self.seed)?;
+        if encrypted.is_empty() {
+            info!("No string could be encrypted; leaving the module unchanged.");
+            return Ok(());
+        }
 
         // Step 3: Generate per-string decryptor thunk functions.
         let mut thunk_codes = Vec::new();
@@ -117,7 +132,7 @@ impl Pass for StringEncryptionPass {
         // The backend assigns addresses and redirects the ELF entry point.
         let original_entry = module.metadata.entry_point;
         let init_code = generate_init_function_with_fixups(&thunk_codes, original_entry);
-        let init_fn = make_thunk_function("__phantom_init", &init_code);
+        let init_fn = make_thunk_function(INIT_FUNCTION, &init_code);
         module.functions.push(init_fn);
 
         info!(
@@ -192,6 +207,9 @@ fn encrypt_strings(
     let mut encrypted = Vec::with_capacity(unique.len());
 
     for &(vaddr, size) in unique {
+        if size == 0 {
+            continue;
+        }
         let section = module.data_section_for_addr_mut(vaddr).ok_or_else(|| {
             PhantomError::Pass(format!("No data section contains string at {vaddr:#x}"))
         })?;
@@ -234,8 +252,8 @@ fn xor_in_place(data: &mut [u8], key: &[u8]) {
     }
 }
 
-/// XOR two byte slices, returning a new Vec (useful for tests).
-pub fn xor_bytes(data: &[u8], key: &[u8]) -> Vec<u8> {
+#[cfg(test)]
+fn xor_bytes(data: &[u8], key: &[u8]) -> Vec<u8> {
     data.iter()
         .enumerate()
         .map(|(i, &b)| b ^ key[i % key.len()])
@@ -258,11 +276,6 @@ use rand::RngCore;
 /// 4. Restores registers and returns
 ///
 /// Key bytes are appended immediately after the RET instruction.
-#[allow(clippy::vec_init_then_push)]
-pub fn generate_thunk(string_vaddr: u64, string_len: usize, key: &[u8]) -> Vec<u8> {
-    generate_thunk_with_fixups(string_vaddr, string_len, key).bytes
-}
-
 #[allow(clippy::vec_init_then_push)]
 fn generate_thunk_with_fixups(string_vaddr: u64, string_len: usize, key: &[u8]) -> RawCodeBlob {
     assert_eq!(key.len(), string_len, "key length must equal string length");
@@ -369,17 +382,6 @@ fn generate_thunk_with_fixups(string_vaddr: u64, string_len: usize, key: &[u8]) 
 /// Each thunk is self-contained: it saves/restores registers and decrypts one string.
 /// We inline them sequentially (replacing each RET with the next thunk) and end
 /// with a jump to the original entry point.
-pub fn generate_init_function(thunk_codes: &[Vec<u8>], original_entry: u64) -> Vec<u8> {
-    let blobs = thunk_codes
-        .iter()
-        .map(|code| RawCodeBlob {
-            bytes: code.clone(),
-            fixups: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    generate_init_function_with_fixups(&blobs, original_entry).bytes
-}
-
 fn generate_init_function_with_fixups(
     thunk_codes: &[RawCodeBlob],
     original_entry: u64,
@@ -540,7 +542,7 @@ mod tests {
     fn test_thunk_contains_vaddr() {
         let vaddr: u64 = 0x0040_2000;
         let key = vec![0x42; 8];
-        let thunk = generate_thunk(vaddr, 8, &key);
+        let thunk = generate_thunk_with_fixups(vaddr, 8, &key).bytes;
 
         let vaddr_bytes = vaddr.to_le_bytes();
         // The vaddr should appear at least once (in the mov rsi, imm64).
@@ -856,12 +858,62 @@ mod tests {
     #[test]
     fn test_thunk_single_byte() {
         let key = vec![0xFF];
-        let thunk = generate_thunk(0x1000, 1, &key);
+        let thunk = generate_thunk_with_fixups(0x1000, 1, &key).bytes;
         assert!(!thunk.is_empty());
         // Key is 1 byte at the end.
         assert_eq!(thunk[thunk.len() - 1], 0xFF);
         // RET before key.
         assert_eq!(thunk[thunk.len() - 2], 0xC3);
+    }
+
+    fn module_with_string(data: &[u8]) -> Module {
+        let mut module = Module::new("m".into(), Architecture::X86_64, BinaryFormat::Elf);
+        module.data_sections.push(DataSection {
+            name: ".rodata".into(),
+            vaddr: 0x600000,
+            file_offset: 0x2000,
+            data: data.to_vec(),
+            permissions: SectionPermissions {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            relocations: vec![],
+        });
+        module.data_refs.push(DataRef {
+            vaddr: 0x600000,
+            size: data.len(),
+            data: data.to_vec(),
+            is_string: true,
+        });
+        module
+    }
+
+    /// A second run would add a second initializer that only undoes its own
+    /// layer, leaving every string still encrypted at run time.
+    #[test]
+    fn refuses_to_run_twice_on_one_module() {
+        let mut module = module_with_string(b"twice\0");
+        StringEncryptionPass::with_seed(1).run(&mut module).unwrap();
+        let after_first = module.data_sections[0].data.clone();
+
+        let err = StringEncryptionPass::with_seed(2)
+            .run(&mut module)
+            .expect_err("second run must be refused");
+        assert!(err.to_string().contains("already"), "{err}");
+        assert_eq!(module.data_sections[0].data, after_first);
+        assert_eq!(module.functions.len(), 1);
+    }
+
+    /// A zero-length thunk would enter its loop with a zero counter and walk
+    /// 4 GiB of memory.
+    #[test]
+    fn skips_zero_length_strings() {
+        let mut module = module_with_string(b"x\0");
+        module.data_refs[0].size = 0;
+        StringEncryptionPass::with_seed(1).run(&mut module).unwrap();
+        assert!(module.function("__phantom_init").is_none());
+        assert_eq!(module.data_sections[0].data, b"x\0");
     }
 
     #[test]
