@@ -3,12 +3,12 @@ use std::ops::Range;
 use goblin::elf::{
     header::{EM_X86_64, ET_DYN},
     program_header::{PT_GNU_RELRO, PT_LOAD},
-    reloc::R_X86_64_RELATIVE,
+    reloc::{R_X86_64_IRELATIVE, R_X86_64_RELATIVE},
     section_header::SHF_ALLOC,
     sym::STT_FUNC,
     Elf,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use phantom_core::{
     ir::{
@@ -21,7 +21,10 @@ use phantom_core::{
 };
 use phantom_disasm::IcedDisassembler;
 
-use crate::x86::{lift_function, string_refs_for_pointers, unmark_loader_owned_strings};
+use crate::x86::{
+    lift_function, string_refs_for_pointers, unmark_loader_owned_strings,
+    unmark_strings_used_before_entry,
+};
 use crate::{Frontend, FrontendError};
 
 /// ELF binary lifter — parses ELF files and lifts them to PhIR.
@@ -89,6 +92,14 @@ fn lift_elf(data: &[u8]) -> Result<Module, FrontendError> {
     slots.extend_from_slice(&relr);
     let loader_ranges = loader_owned_ranges(&slots, &module.metadata.program_headers);
     unmark_loader_owned_strings(&mut module, &loader_ranges);
+
+    let kept = unmark_strings_used_before_entry(&mut module, &pre_entry_routines(&elf, data));
+    if kept > 0 {
+        warn!(
+            "{kept} string(s) used by preinit or IFUNC routines, which run before the \
+             entry point, are left unencrypted"
+        );
+    }
 
     debug!(
         functions = module.functions.len(),
@@ -245,6 +256,8 @@ fn pointer_targets(
         .collect()
 }
 
+const DT_PREINIT_ARRAY: u64 = 32;
+const DT_PREINIT_ARRAYSZ: u64 = 33;
 const DT_RELRSZ: u64 = 35;
 const DT_RELR: u64 = 36;
 
@@ -314,6 +327,37 @@ fn decode_relr(entries: impl IntoIterator<Item = u64>) -> Vec<u64> {
         }
     }
     slots
+}
+
+/// Routines the dynamic loader runs before the entry point of a dynamically
+/// linked executable: `DT_PREINIT_ARRAY` entries and the IFUNC resolvers behind
+/// `R_X86_64_IRELATIVE`. A static executable runs both from its own start-up
+/// code, after the entry point.
+fn pre_entry_routines(elf: &Elf, data: &[u8]) -> Vec<u64> {
+    if elf.interpreter.is_none() {
+        return Vec::new();
+    }
+    let relocs = || elf.dynrelas.iter().chain(elf.pltrelocs.iter());
+    let mut routines: Vec<u64> = relocs()
+        .filter(|r| r.r_type == R_X86_64_IRELATIVE)
+        .filter_map(|r| r.r_addend.map(|a| a as u64))
+        .collect();
+
+    let Some(dynamic) = &elf.dynamic else {
+        return routines;
+    };
+    let tag = |t| dynamic.dyns.iter().find(|d| d.d_tag == t).map(|d| d.d_val);
+    if let (Some(array), Some(size)) = (tag(DT_PREINIT_ARRAY), tag(DT_PREINIT_ARRAYSZ)) {
+        // A PIE stores zeros in the slots and supplies the addresses through
+        // relative relocations; otherwise the file holds them.
+        for slot in (0..size / 8).filter_map(|i| array.checked_add(i * 8)) {
+            let relocated = relocs()
+                .find(|r| r.r_offset == slot && r.r_type == R_X86_64_RELATIVE)
+                .and_then(|r| r.r_addend.map(|a| a as u64));
+            routines.extend(relocated.or_else(|| read_u64_at_vaddr(elf, data, slot)));
+        }
+    }
+    routines
 }
 
 /// Ranges the loader writes or write-protects before the entry point: each

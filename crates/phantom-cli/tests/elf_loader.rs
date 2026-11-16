@@ -92,3 +92,28 @@ int main(void) { puts(table.name); puts(table.next); return 0; }
     let bin = Protected::build("relro", source, &["-fPIE", "-pie"]);
     assert_runs(&bin.run(), "relro-probe\ntail\n");
 }
+
+/// `DT_PREINIT_ARRAY` routines run inside the dynamic loader before the entry
+/// point, so strings they use must still be plaintext when they run.
+#[test]
+fn strings_used_before_entry_stay_readable() {
+    let source = r#"
+#include <stdio.h>
+#include <unistd.h>
+static void early(int argc, char **argv, char **envp) {
+    static const char msg[] = "preinit-probe\n";
+    (void)argc; (void)argv; (void)envp;
+    write(1, msg, sizeof msg - 1);
+}
+__attribute__((section(".preinit_array"), used))
+static void (*run_early)(int, char **, char **) = early;
+int main(void) { puts("main-probe"); return 0; }
+"#;
+    let bin = Protected::build("preinit", source, &["-fPIE", "-pie"]);
+    assert_runs(&bin.run(), "preinit-probe\nmain-probe\n");
+    let protected = std::fs::read(&bin.output).expect("read protected binary");
+    assert!(
+        !protected.windows(10).any(|w| w == b"main-probe"),
+        "strings used only after entry should still be encrypted"
+    );
+}
