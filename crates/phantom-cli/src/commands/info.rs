@@ -1,16 +1,10 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::Result;
-use phantom_frontends::detect_frontend;
 
 /// Display binary metadata.
-pub fn run(input: &PathBuf) -> Result<()> {
-    let data = std::fs::read(input)?;
-
-    let frontend =
-        detect_frontend(&data).ok_or_else(|| anyhow::anyhow!("Unsupported binary format"))?;
-
-    let module = frontend.lift(&data)?;
+pub fn run(input: &Path) -> Result<()> {
+    let (_, module) = super::load(input)?;
 
     println!("Binary: {}", input.display());
     println!("Architecture: {:?}", module.arch);

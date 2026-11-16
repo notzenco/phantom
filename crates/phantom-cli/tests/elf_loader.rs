@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use common::{temp_path, BIN};
@@ -116,4 +116,88 @@ int main(void) { puts("main-probe"); return 0; }
         !protected.windows(10).any(|w| w == b"main-probe"),
         "strings used only after entry should still be encrypted"
     );
+}
+
+fn compile(name: &str, source: &str) -> PathBuf {
+    let src = temp_path(name).with_extension("c");
+    let binary = temp_path(name);
+    std::fs::write(&src, source).expect("write source");
+    let compile = Command::new("cc")
+        .args(["-O2", "-o"])
+        .arg(&binary)
+        .arg(&src)
+        .output()
+        .expect("run cc");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let _ = std::fs::remove_file(src);
+    binary
+}
+
+fn protect_with(input: &Path, output: &Path, extra: &[&str]) -> Output {
+    Command::new(BIN)
+        .args(["protect", "--profile", "strings", "-i"])
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .args(extra)
+        .output()
+        .expect("run phantom-cli protect")
+}
+
+#[test]
+fn seeded_protection_is_reproducible_and_summarised() {
+    let input = compile(
+        "seeded",
+        "#include <stdio.h>\nint main(void) { puts(\"seeded-probe\"); return 0; }\n",
+    );
+    let (first, second) = (temp_path("seeded-a"), temp_path("seeded-b"));
+    let run = protect_with(&input, &first, &["--seed", "7"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(protect_with(&input, &second, &["--seed", "7"])
+        .status
+        .success());
+
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&second).unwrap()
+    );
+    let summary = String::from_utf8_lossy(&run.stdout);
+    for line in [
+        "functions lifted:",
+        "passes: string_encryption",
+        "data encrypted:",
+        "size:",
+    ] {
+        assert!(
+            summary.contains(line),
+            "missing {line:?} in summary:\n{summary}"
+        );
+    }
+    for path in [input, first, second] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn protection_that_changes_nothing_is_an_error() {
+    let input = compile("no-strings", "int main(void) { return 0; }\n");
+    let output = temp_path("no-strings-out");
+    let run = protect_with(&input, &output, &[]);
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert!(String::from_utf8_lossy(&run.stderr).contains("found nothing to protect"));
+    assert!(!output.exists(), "no output should be written");
+    let _ = std::fs::remove_file(input);
 }

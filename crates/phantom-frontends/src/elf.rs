@@ -87,6 +87,12 @@ fn lift_elf(data: &[u8]) -> Result<Module, FrontendError> {
     // Lift functions from symbol table.
     let functions = lift_functions(&elf, data, bitness, &module.data_sections)?;
     module.functions = functions;
+    if elf.syms.is_empty() {
+        warn!(
+            "No symbol table (stripped binary): code is not lifted, so only strings \
+             reached through pointers in data can be encrypted"
+        );
+    }
 
     let mut slots = relocated_slots(&elf);
     slots.extend_from_slice(&relr);

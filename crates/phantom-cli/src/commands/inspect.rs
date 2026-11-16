@@ -1,16 +1,10 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::Result;
-use phantom_frontends::detect_frontend;
 
 /// Dump PhIR for a binary.
-pub fn run(input: &PathBuf, function: Option<&str>, json: bool) -> Result<()> {
-    let data = std::fs::read(input)?;
-
-    let frontend =
-        detect_frontend(&data).ok_or_else(|| anyhow::anyhow!("Unsupported binary format"))?;
-
-    let module = frontend.lift(&data)?;
+pub fn run(input: &Path, function: Option<&str>, json: bool) -> Result<()> {
+    let (_, module) = super::load(input)?;
 
     let functions: Vec<_> = if let Some(name) = function {
         module.functions.iter().filter(|f| f.name == name).collect()

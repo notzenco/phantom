@@ -177,7 +177,10 @@ fn validate_passes(passes: &[String], owner: &str) -> Result<()> {
 
     for pass_name in passes {
         if !available.contains(pass_name.as_str()) {
-            return Err(anyhow!("{owner} references unknown pass '{}'", pass_name));
+            return Err(anyhow!(
+                "{owner} references unknown pass '{pass_name}'. Available passes: {}",
+                phantom_passes::available_passes().join(", ")
+            ));
         }
     }
 
