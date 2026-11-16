@@ -68,13 +68,32 @@ def phantom_command(args: argparse.Namespace, input_path: Path, output_path: Pat
     ]
 
 
+# Generous enough for the first `cargo run` to compile phantom-cli; a protected
+# binary that hangs fails its stage instead of stalling the whole matrix.
+COMMAND_TIMEOUT_S = 600
+TIMED_OUT = 124
+
+
 def run_command(
     command: list[str], cwd: Path, env: dict[str, str] | None = None
 ) -> tuple[int, str, str, float]:
     start = time.perf_counter()
-    proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True, env=env)
+    try:
+        # A broken protection can print ciphertext, which must not crash decoding.
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=env,
+            timeout=COMMAND_TIMEOUT_S,
+        )
+        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        returncode, stdout, stderr = TIMED_OUT, "", f"timed out after {COMMAND_TIMEOUT_S}s"
     duration_ms = (time.perf_counter() - start) * 1000
-    return proc.returncode, proc.stdout, proc.stderr, duration_ms
+    return returncode, stdout, stderr, duration_ms
 
 
 def stage_record(
