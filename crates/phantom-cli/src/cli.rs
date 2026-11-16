@@ -3,8 +3,12 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "phantom", about = "Open-source code protector")]
+#[command(name = "phantom-cli", version, about = "Open-source code protector")]
 pub struct Cli {
+    /// Show more log output (-v info, -vv debug, -vvv trace); RUST_LOG overrides
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -42,6 +46,10 @@ pub struct ProtectArgs {
     /// TOML file providing additional profile definitions
     #[arg(long, requires = "profile")]
     pub profile_file: Option<PathBuf>,
+
+    /// Seed for the passes' random choices, for reproducible output
+    #[arg(long)]
+    pub seed: Option<u64>,
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]

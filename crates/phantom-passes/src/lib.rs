@@ -6,8 +6,16 @@ use phantom_core::pass::Pass;
 
 /// Return a pass by name, or `None` if unknown.
 pub fn get_pass(name: &str) -> Option<Box<dyn Pass>> {
+    get_seeded_pass(name, None)
+}
+
+/// Return a pass by name whose random choices follow `seed` when one is given.
+pub fn get_seeded_pass(name: &str, seed: Option<u64>) -> Option<Box<dyn Pass>> {
     match name {
-        "string_encryption" => Some(Box::new(StringEncryptionPass::new())),
+        "string_encryption" => Some(Box::new(match seed {
+            Some(seed) => StringEncryptionPass::with_seed(seed),
+            None => StringEncryptionPass::new(),
+        })),
         _ => None,
     }
 }
