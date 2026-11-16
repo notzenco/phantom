@@ -406,7 +406,7 @@ pub(crate) fn unmark_loader_owned_strings(module: &mut Module, ranges: &[Range<u
         if !dref.is_string {
             continue;
         }
-        let span = dref.vaddr..dref.vaddr + dref.size as u64;
+        let span = dref.vaddr..dref.vaddr.saturating_add(dref.size as u64);
         if ranges
             .iter()
             .any(|r| r.start < span.end && span.start < r.end)
@@ -418,6 +418,25 @@ pub(crate) fn unmark_loader_owned_strings(module: &mut Module, ranges: &[Range<u
             dref.is_string = false;
         }
     }
+}
+
+/// Leave plaintext every string referenced directly by a routine that runs
+/// before the protected entry point (TLS callbacks, preinit routines, IFUNC
+/// resolvers), wherever else it is referenced, and return how many distinct
+/// strings that kept. Strings reached only through their callees are not found.
+pub(crate) fn unmark_strings_used_before_entry(module: &mut Module, routines: &[u64]) -> usize {
+    let spans: BTreeSet<(u64, u64)> = module
+        .functions
+        .iter()
+        .filter(|f| routines.contains(&f.address))
+        .flat_map(|f| f.instructions())
+        .flat_map(|insn| &insn.data_refs)
+        .filter(|d| d.is_string)
+        .map(|d| (d.vaddr, d.vaddr.saturating_add(d.size as u64)))
+        .collect();
+    let ranges: Vec<_> = spans.iter().map(|&(start, end)| start..end).collect();
+    unmark_loader_owned_strings(module, &ranges);
+    spans.len()
 }
 
 /// Check if a byte slice looks like a printable ASCII string (optionally null-terminated).
@@ -594,6 +613,57 @@ fn branch_target(insn: &iced_x86::Instruction) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn strings_used_before_entry_are_unmarked_everywhere() {
+        use phantom_core::{Architecture, BasicBlock, BinaryFormat, BlockId, Terminator};
+
+        let string = |vaddr| DataRef {
+            vaddr,
+            size: 4,
+            data: b"abc\0".to_vec(),
+            is_string: true,
+        };
+        let function = |addr, refs| {
+            let mut f = Function::new(format!("f{addr:x}"), addr, 1);
+            f.blocks.push(BasicBlock {
+                id: BlockId(0),
+                start_addr: addr,
+                end_addr: addr + 1,
+                instructions: vec![Instruction {
+                    address: addr,
+                    original_bytes: vec![0x90],
+                    opcode: Opcode::Nop,
+                    operands: vec![],
+                    operand_size: OperandSize::Byte,
+                    data_refs: refs,
+                    meta: InstructionMeta::default(),
+                }],
+                terminator: Terminator::Return,
+            });
+            f
+        };
+        let mut module = Module::new("m".into(), Architecture::X86_64, BinaryFormat::Pe);
+        module
+            .functions
+            .push(function(0x1000, vec![string(0x5000)]));
+        module
+            .functions
+            .push(function(0x2000, vec![string(0x5000), string(0x6000)]));
+        module.data_refs.push(string(0x5000));
+
+        let kept = unmark_strings_used_before_entry(&mut module, &[0x1000]);
+
+        assert_eq!(kept, 1);
+        let late = &module.functions[1].blocks[0].instructions[0].data_refs;
+        assert!(!late[0].is_string, "shared string must stay plaintext");
+        assert!(
+            late[1].is_string,
+            "string only used after entry stays eligible"
+        );
+        assert!(!module.data_refs[0].is_string);
+    }
+
     use super::*;
 
     #[test]
